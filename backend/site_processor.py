@@ -20,7 +20,7 @@ L1800_F2_EARFCNS = [1250, 1257]
 
 # Updated header: Total Physical Sites comes right after day
 SITE_SUMMARY_HEADER = [
-    'day',
+    'Day-',
     'Total Physical Sites (2G+3G+4G)',
     '2G physical sites',
     '2G GSM900 Band',

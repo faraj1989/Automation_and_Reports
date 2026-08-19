@@ -11,6 +11,35 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Huawei PM export null markers. "/0" means the KPI's ratio had zero
+# attempts in that hour (counter divide-by-zero) - it is NOT the same as a
+# 0% success rate, which means attempts were made and all failed. "NIL"
+# means the counter was not collected/supported for that cell. Both must
+# become NaN, never 0 - treating them as 0 would flag a quiet, healthy cell
+# as a critical failure.
+NULL_TOKENS = ['/0', 'NIL', 'NULL', 'N/A', '--']
+
+
+def clean_null_tokens(df):
+    """Replace Huawei's non-numeric null markers with NaN, then coerce any
+    column that is now fully numeric back to a numeric dtype (read_csv left
+    it as object/string purely because of the stray markers)."""
+    df = df.replace(NULL_TOKENS, pd.NA)
+    for col in df.columns:
+        # Newer pandas may read text columns as object OR as a string dtype
+        # (e.g. "string[pyarrow]") depending on backend config - checking
+        # "not already numeric" catches both, instead of assuming object.
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        coerced = pd.to_numeric(df[col], errors='coerce')
+        # Only swap in the numeric version if this didn't just turn
+        # genuine text (site names, "Whole Network", "100%", ...) into
+        # NaN - that would mean the column was never numeric to begin with.
+        still_has_text = df[col].notna() & coerced.isna()
+        if not still_has_text.any():
+            df[col] = coerced
+    return df
+
 
 def detect_delimiter(filepath):
     """
@@ -134,6 +163,13 @@ def read_csv_skip_metadata(filepath, header_keywords=None, delimiter=None):
 
     # Clean column names (strip spaces)
     df.columns = df.columns.str.strip()
+
+    # Normalize Huawei's "/0" and "NIL" null markers to NaN across all columns
+    null_counts = {col: int((df[col].astype(str).isin(NULL_TOKENS)).sum()) for col in df.columns}
+    total_nulls = sum(null_counts.values())
+    if total_nulls > 0:
+        df = clean_null_tokens(df)
+        logger.info(f"🧹 Normalized {total_nulls} '/0' or 'NIL' markers to NaN in {os.path.basename(filepath)}")
 
     logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns from {os.path.basename(filepath)}")
 

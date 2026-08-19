@@ -4,7 +4,14 @@ output/
 kpi_analysis_reports/
 __pycache__/
 *.pyc
+*.log
 *.csv
+!config/kpi_thresholds.csv
+!config/site_topology.csv
 *.xlsx
 .venv/
 venv/
+
+# Credentials - never commit
+ftp_config.json
+ftp_config.jason

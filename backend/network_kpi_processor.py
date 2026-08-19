@@ -60,6 +60,7 @@ def process_network_kpis(day_folder, log_callback=None):
     """
     Process all 6 network KPI files in the day folder.
     Returns a dictionary: sheet_name -> DataFrame
+    Handles: Date normalization, empty row removal, duplicate detection, logging
     """
 
     def log(msg):
@@ -86,16 +87,28 @@ def process_network_kpis(day_folder, log_callback=None):
             try:
                 df = read_csv_skip_metadata(file_path)
                 if df is not None and not df.empty:
-                    # Convert Date column to string for consistency
+                    rows_before = len(df)
+                    
+                    # 1. Remove completely empty rows (all NaN values)
+                    df = df.dropna(how='all')
+                    empty_rows_removed = rows_before - len(df)
+                    if empty_rows_removed > 0:
+                        log(f"   🗑️  Removed {empty_rows_removed} completely empty rows")
+                    
+                    # 2. Normalize Date column to YYYY-MM-DD format
                     if 'Date' in df.columns:
-                        df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+                        try:
+                            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                            log(f"   ✅ Normalized dates to YYYY-MM-DD format")
+                        except Exception as e:
+                            log(f"   ⚠️ Could not normalize dates: {e}")
 
-                    # Check for duplicate rows within the file itself
+                    # 3. Remove duplicate rows within the file itself
                     if 'Date' in df.columns:
                         dup_count = df.duplicated(
                             subset=['Date', 'Whole Network']).sum() if 'Whole Network' in df.columns else 0
                         if dup_count > 0:
-                            log(f"   ⚠️ Found {dup_count} duplicate rows in file, removing duplicates")
+                            log(f"   ⚠️ Found {dup_count} duplicate rows in file, removing them")
                             df = df.drop_duplicates(
                                 subset=['Date', 'Whole Network']) if 'Whole Network' in df.columns else df
 

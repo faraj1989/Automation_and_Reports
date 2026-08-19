@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!usrbinenv python3.txt
+# !/usr/bin/env python3
 """
 Libyana NPM - User KPI Processor
 Processes 5 user CSV files with MAX aggregation per day.
@@ -30,7 +31,12 @@ USER_KPI_FILES = {
             '*CS Roaming*.csv'
         ],
         'sheet_name': 'User_CS_Roaming',
-        'filter': {'column': 'index', 'value': '21891', 'contains': True}
+        'filter': {'column': 'index', 'value': '218919121253', 'contains': True},
+        'aggregate': {
+            'groupby': 'Time',  # Group by hour first
+            'sum_columns': ['Number of Registered Subscribers(entries)'],
+            'then_max': True  # Then take MAX per day
+        }
     },
     'CS_Subscribers': {
         'patterns': [
@@ -49,7 +55,19 @@ USER_KPI_FILES = {
             '*PS Roaming*.csv'
         ],
         'sheet_name': 'User_PS_Roaming',
-        'filter': {'column': 'Mobile country code', 'value': 606, 'contains': False}
+        'filter': [
+            {'column': 'Mobile country code', 'value': 606, 'operator': 'eq'},
+            {'column': 'Mobile network code', 'value': 1, 'operator': 'eq'}
+        ],
+        'aggregate': {
+            'groupby': 'Time',  # Group by hour first
+            'sum_columns': [
+                'Gb mode maximum users with act PDP context per PLMN(number)',
+                'Iu mode maximum users with act PDP context per PLMN(number)',
+                'S1 Mode Maximum PDN Connection Number per PLMN(number)'
+            ],
+            'then_max': True  # Then take MAX per day
+        }
     },
     'PS_Subscribers': {
         'patterns': [
@@ -108,26 +126,86 @@ def process_user_kpis(day_folder, log_callback=None):
                 if df is not None and not df.empty:
                     # Convert Time to Date if needed
                     if 'Time' in df.columns:
-                        df['Date'] = pd.to_datetime(df['Time']).dt.strftime('%Y-%m-%d')
+                        df['DateTime'] = pd.to_datetime(df['Time'])
+                        df['Date'] = df['DateTime'].dt.strftime('%Y-%m-%d')
+                        df['Hour'] = df['DateTime'].dt.hour
                     elif 'Date' in df.columns:
                         df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
 
                     # Apply filter if configured
                     if 'filter' in config:
                         filter_config = config['filter']
-                        col = filter_config['column']
-                        val = filter_config['value']
-                        contains = filter_config.get('contains', False)
 
-                        if col in df.columns:
-                            if contains:
-                                df = df[df[col].astype(str).str.contains(str(val), na=False)]
+                        # Handle single filter
+                        if isinstance(filter_config, dict):
+                            col = filter_config['column']
+                            val = filter_config['value']
+                            contains = filter_config.get('contains', False)
+                            operator = filter_config.get('operator', 'eq')
+
+                            if col in df.columns:
+                                if contains:
+                                    df = df[df[col].astype(str).str.contains(str(val), na=False)]
+                                elif operator == 'eq':
+                                    df = df[df[col] == val]
+                                log(f"   🔍 Filtered {col}={val}: {len(df)} rows")
+
+                        # Handle multiple filters (AND condition)
+                        elif isinstance(filter_config, list):
+                            for f in filter_config:
+                                col = f['column']
+                                val = f['value']
+                                operator = f.get('operator', 'eq')
+
+                                if col in df.columns:
+                                    if operator == 'eq':
+                                        df = df[df[col] == val]
+                                    elif operator == 'ne':
+                                        df = df[df[col] != val]
+                                    elif operator == 'gt':
+                                        df = df[df[col] > val]
+                                    elif operator == 'lt':
+                                        df = df[df[col] < val]
+                                    log(f"   🔍 Filtered {col}={val}: {len(df)} rows")
+
+                    # --- SPECIAL AGGREGATION: Group by Time (hour) and SUM, then MAX per day ---
+                    if 'aggregate' in config and 'Time' in df.columns:
+                        agg_config = config['aggregate']
+                        groupby_col = agg_config.get('groupby', 'Time')
+                        sum_cols = agg_config.get('sum_columns', [])
+                        then_max = agg_config.get('then_max', True)
+
+                        # Filter to only columns that exist in the dataframe
+                        existing_sum_cols = [col for col in sum_cols if col in df.columns]
+
+                        if existing_sum_cols and groupby_col in df.columns:
+                            # Step 1: Group by Time (hour) and SUM the specified columns
+                            # Need to group by Date, Hour to keep them separate
+                            if 'Date' in df.columns and 'Hour' in df.columns:
+                                # Group by Date and Hour
+                                df_grouped = df.groupby(['Date', 'Hour'])[existing_sum_cols].sum().reset_index()
+                                log(f"   📊 Grouped by Date+Hour, summed {len(existing_sum_cols)} columns: {len(df_grouped)} rows")
+
+                                # Step 2: Group by Date and take MAX for each column
+                                if then_max:
+                                    df_aggregated = df_grouped.groupby('Date')[existing_sum_cols].max().reset_index()
+                                    # Keep Date column
+                                    df_aggregated['Date'] = df_aggregated['Date']
+                                    log(f"   📊 Aggregated by Date (MAX): {len(df_aggregated)} rows")
+                                else:
+                                    df_aggregated = df_grouped
                             else:
-                                df = df[df[col] == val]
-                            log(f"   🔍 Filtered {col}={val}: {len(df)} rows")
+                                # Fallback: just group by Date
+                                df_aggregated = df.groupby('Date')[existing_sum_cols].max().reset_index()
+                                log(f"   📊 Aggregated by Date (MAX): {len(df_aggregated)} rows")
 
-                    # --- AGGREGATE BY DATE TAKING MAX for all numeric columns ---
-                    if 'Date' in df.columns:
+                            # Replace df with aggregated version
+                            df = df_aggregated
+                        else:
+                            log(f"   ⚠️ No sum columns found for aggregation")
+
+                    # --- STANDARD AGGREGATION: Group by Date taking MAX for all numeric columns ---
+                    elif 'Date' in df.columns:
                         # Identify numeric columns
                         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
 
@@ -136,7 +214,8 @@ def process_user_kpis(day_folder, log_callback=None):
                             df_aggregated = df.groupby('Date')[numeric_cols].max().reset_index()
 
                             # Also include any non-numeric columns that should be carried through
-                            non_numeric_cols = [col for col in df.columns if col not in numeric_cols and col != 'Date']
+                            non_numeric_cols = [col for col in df.columns if
+                                                col not in numeric_cols and col not in ['Date', 'DateTime', 'Hour']]
                             if non_numeric_cols:
                                 # For non-numeric columns (like 'Whole Network', 'Integrity'),
                                 # take the first value per date (assuming it's constant)
@@ -228,43 +307,42 @@ def aggregate_user_data(results_dict):
 
     # --- 1. CS Roaming (MAX per day) ---
     if df_cs_roaming is not None and not df_cs_roaming.empty:
+        # The data should already be aggregated by Date with MAX
+        # Look for the 'Number of Registered Subscribers(entries)' column
+        # which has been summed per hour and then maxed per day
         roaming_col = None
         for col in df_cs_roaming.columns:
-            if 'Registered Subscribers' in col or 'Number of Registered Subscribers' in col:
+            if 'Number of Registered Subscribers(entries)' in col or 'Registered Subscribers' in col:
                 roaming_col = col
                 break
 
         if roaming_col and 'Date' in df_cs_roaming.columns:
             roaming_df = df_cs_roaming[['Date', roaming_col]].copy()
             roaming_df = roaming_df.rename(columns={roaming_col: 'Roaming CS (Almadar)'})
-            # Take MAX per day
-            roaming_df = roaming_df.groupby('Date').max().reset_index()
             base_df = pd.merge(base_df, roaming_df, on='Date', how='outer')
 
     # --- 2. PS Roaming (2G, 3G, 4G SEPARATE - NO SUMMING) ---
     if df_ps_roaming is not None and not df_ps_roaming.empty:
-        cols = ['Date']
+        # The data should already be aggregated with sums per hour and max per day
         rename_map = {}
 
         for col in df_ps_roaming.columns:
-            if 'Gb mode attached Max user number per PLMN' in col:
-                cols.append(col)
+            if 'Gb mode maximum users with act PDP context per PLMN(number)' in col:
                 rename_map[col] = 'Roaming 2G PS (Gb)'
-            elif 'Iu mode attached Max user number per PLMN' in col:
-                cols.append(col)
+            elif 'Iu mode maximum users with act PDP context per PLMN(number)' in col:
                 rename_map[col] = 'Roaming 3G PS (Iu)'
-            elif 'S1 Mode Maximum Attached Users per PLMN' in col:
-                cols.append(col)
+            elif 'S1 Mode Maximum PDN Connection Number per PLMN(number)' in col:
                 rename_map[col] = 'Roaming 4G PS (S1)'
 
-        if len(cols) > 1 and 'Date' in df_ps_roaming.columns:
-            ps_roam_df = df_ps_roaming[cols].copy()
-            # Take MAX per day for each column
-            numeric_cols = ps_roam_df.select_dtypes(include=['number']).columns.tolist()
-            if numeric_cols:
-                ps_roam_df = ps_roam_df.groupby('Date')[numeric_cols].max().reset_index()
-            ps_roam_df = ps_roam_df.rename(columns=rename_map)
-            base_df = pd.merge(base_df, ps_roam_df, on='Date', how='outer')
+        if rename_map and 'Date' in df_ps_roaming.columns:
+            # Select only columns that exist and are in rename_map
+            cols_to_keep = ['Date'] + list(rename_map.keys())
+            existing_cols = [col for col in cols_to_keep if col in df_ps_roaming.columns]
+
+            if len(existing_cols) > 1:
+                ps_roam_df = df_ps_roaming[existing_cols].copy()
+                ps_roam_df = ps_roam_df.rename(columns=rename_map)
+                base_df = pd.merge(base_df, ps_roam_df, on='Date', how='outer')
 
     # --- 3. PS Subscribers (MAX per day) ---
     if df_ps_subs is not None and not df_ps_subs.empty:

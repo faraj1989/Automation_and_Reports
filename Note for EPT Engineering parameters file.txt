@@ -1,0 +1,20 @@
+i have a file   C:\Users\user\Desktop\python\Libyana Daily Report - Copy\config\Libyana MS EPT_v24062026-Whole Network
+this file is mually updated by RF engineersing it contains EPT engineering paramets with physical sites in the network its not directly fo m the system so may be contains type or incorreclt 100% data ,
+people make mistakes , for example its contains Longitude	Latitude	Azimuth	Mechanical Tilt	Electric Tilt	Antenna Height (m)
+ these type of data is not recorded i  the ystem but other like City	Site Name	eNodeB Name	eNodeB ID	Sector ID	Sector Name	Cell ID_DEC	LOCAL CELL ID	Cell ID_HEX	Cell Name
+ already in our historical output/csvs our scv is the correctly accuracy data because it comes direclyfrom the syytem ,
+
+so ept data like :
+Region	City	Site Name	eNodeB Name	eNodeB ID	Sector ID	Sector Name	Cell ID_DEC	LOCAL CELL ID	Cell ID_HEX	Cell Name	Longitude	Latitude	Azimuth	Mechanical Tilt	Electric Tilt	Antenna Height (m)	TAC_DEC	TAC_HEX	ECI	Type	Frequency Band	Bandwidth (MHz)	DL EARFCN	PCI	RSI	Cell Radius (m)	CRS Port Number	mTnR	PA (dB)	PB	CRS Power (dBm)	Site Scenario	Active Status	Urban area	inter-site distance (km)	
+East	TBRK City	ABDN001(FN)	LABDN001	3047	1	ABDN001(FN)-1	1	1	1	LABDN001-1	23.92025	31.86508	30	0	3	35	6430	191E	780033	LTE1800	3	20	1401	333	529	10000	CRS_PORT_2	2T2R	-3	1	18.2	2T3S(2T2R)	CELL_ACTIVE	SU	2.754	
+East	TBRK City	ABDN001(FN)	LABDN001	3047	2	ABDN001(FN)-2	2	2	2	LABDN001-2	23.92025	31.86508	200	0	2	35	6430	191E	780034	LTE1800	3	20	1401	334	239	10000	CRS_PORT_2	2T2R	-3	1	18.2	2T3S(2T2R)	CELL_ACTIVE	SU	2.754	
+East	TBRK City	ABDN001(FN)	LABDN001	3047	3	ABDN001(FN)-3	3	3	3	LABDN001-3	23.92025	31.86508	280	0	2	35	6430	191E	780035	LTE1800	3	20	1401	335	412	10000	CRS_PORT_2	2T2R	-3	1	18.2	2T3S(2T2R)	CELL_ACTIVE	SU	2.754	
+East	TBRK City	ABDN002	LABDN002	3048	1	ABDN002-1	1	1	1	LABDN002-1	23.9172	31.88971	340	0	0	42	6430	191E	780289	LTE1800	3	20	1401	30	799	10000	CRS_PORT_4	4T4R	-3	1	18.2	4T6S	CELL_ACTIVE	SU	2.754	
+East	TBRK City	ABDN002	LABDN002	3048	1	ABDN002-1	7	7	7	LABDN002-12	23.9172	31.88971	40	0	0	42	6430	191E	780295	LTE1800	3	20	1401	140	175	10000	CRS_PORT_4	4T4R	-3	1	18.2	4T6S	CELL_ACTIVE	SU	2.754	
+
+
+
+i want you to read an dunder stand the file Libyana MS EPT_v24062026-Whole Network excel and tell me what we can do to aling this phyicasl paramets and first confirm its contents with our csv file and upate Libyana MS EPT_v24062026-Whole Network if needed and you tell me what to can add , i want to cosider special tab in dashboard for this EPT or merge it with our already sites and cells data so will be a dash board showing all EPT and from this ept we need to make and kml files and excel like it with last update so any time my collegeues or supervisor whenever need it directly down;load it from the dash boar with updated verion and keep it in mind wwe will making more requests use this ept like when users aask comlaint and weak signal or my team RF team want to investigate the reson why some areas in out netwroks has week signal so new tab will be for this section as coverage cmplaint when the user enter the nearest corrdinates to dashboard aftertha our intiligent system will connect the compaintaa rae cordinats with our exiting EPT sites and cell and match them and give them the nearst or the neibours complaier should be in sercing cell and make connection n na dalasys this use complainer reason like if the naresrt 4gcells have hard kpis or congested or need expamnsion and i mean analaysi all its pridcted ecell names and output summary reson of week coverage and propose solution to solve it ,
+
+
+also you can rad it all and understand it and tell me you exrest recommendations to be a profesionala RF enginerr dashboard 

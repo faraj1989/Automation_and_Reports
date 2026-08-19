@@ -30,6 +30,31 @@ class CSVHistoryManager:
         self.csv_folder = os.path.join(output_folder, "csv")
         self._ensure_folders()
 
+    def _normalize_date(self, date_value):
+        """
+        Normalize any date format to YYYY-MM-DD.
+        Handles mixed formats: "8/12/2026", "2026-08-12", etc.
+        Returns None if invalid.
+        """
+        if date_value is None or pd.isna(date_value):
+            return None
+        try:
+            date_str = str(date_value).strip()
+            if not date_str:
+                return None
+            # Try to parse - handles multiple formats
+            dt = pd.to_datetime(date_str, errors='coerce')
+            if pd.isna(dt):
+                logger.warning(f"Could not parse date: {date_value}")
+                return str(date_value)
+            normalized = dt.strftime('%Y-%m-%d')
+            if date_str != normalized:
+                logger.debug(f"Normalized date: {date_str} → {normalized}")
+            return normalized
+        except Exception as e:
+            logger.warning(f"Error normalizing date {date_value}: {e}")
+            return str(date_value)
+
     def _ensure_folders(self):
         """Create output folders if they don't exist."""
         os.makedirs(self.csv_folder, exist_ok=True)
@@ -133,7 +158,11 @@ class CSVHistoryManager:
 
         
     def update_site_row(self, row_dict):
-        """Update or append a row to SiteSummary CSV."""
+        """
+        Update or append a row to SiteSummary CSV.
+        Handles mixed date formats by normalizing before comparison.
+        Prevents duplicates when source data has same dates in different formats.
+        """
         if not row_dict:
             return
 
@@ -142,29 +171,137 @@ class CSVHistoryManager:
             logger.warning("Row has no 'day' field")
             return
 
+        # Normalize the input date
+        day_normalized = self._normalize_date(day)
+        if not day_normalized:
+            logger.error(f"Could not normalize date: {day}")
+            return
+
         try:
             df = self._read_csv('SiteSummary')
-            if not df.empty and day in df['day'].values:
-                idx = df[df['day'] == day].index[0]
-                for col in SITE_SUMMARY_HEADER:
-                    df.at[idx, col] = row_dict.get(col, 0)
-                logger.info(f"Updated SiteSummary for day {day}")
+            
+            if not df.empty:
+                # Normalize all existing dates for comparison
+                df['_day_normalized'] = df['day'].apply(self._normalize_date)
+                existing_rows = df[df['_day_normalized'] == day_normalized]
+                
+                if not existing_rows.empty:
+                    # Row exists - UPDATE it
+                    idx = existing_rows.index[0]
+                    for col in SITE_SUMMARY_HEADER:
+                        if col != 'day':  # Preserve original date format
+                            df.at[idx, col] = row_dict.get(col, 0)
+                    logger.info(f"🔄 Updated SiteSummary for {day_normalized} (format: {day})")
+                else:
+                    # New row - APPEND it
+                    row_dict['day'] = day_normalized  # Use normalized format
+                    new_row = pd.DataFrame([row_dict])
+                    df = pd.concat([df, new_row], ignore_index=True)
+                    logger.info(f"➕ Appended SiteSummary for {day_normalized}")
+                
+                # Clean up temp column
+                df = df.drop('_day_normalized', axis=1)
             else:
-                new_row = pd.DataFrame([row_dict])
-                df = pd.concat([df, new_row], ignore_index=True)
-                logger.info(f"Appended SiteSummary for day {day}")
+                # First entry
+                row_dict['day'] = day_normalized
+                df = pd.DataFrame([row_dict])
+                logger.info(f"📝 Created SiteSummary with first entry: {day_normalized}")
 
             self._write_csv('SiteSummary', df)
         except Exception as e:
             logger.error(f"Failed to update SiteSummary: {e}")
             raise
 
-    def update_site_detail(self, df):
-        """Replace the entire SiteDetail CSV."""
+    def update_site_detail(self, df, target_date=None):
+        """
+        Merge today's site detail snapshot into the stored table.
+
+        Site configuration (bands, sectors, RAT) rarely changes day to day,
+        so this keeps exactly one row per site rather than accumulating
+        history, and only advances "Last Updated" for a site when its data
+        actually changed (or the site is new). Unchanged sites keep their
+        existing row untouched, including their existing "Last Updated"
+        date, so that column tracks the last real change per site, not the
+        last time the pipeline happened to run.
+
+        A site missing from today's snapshot (e.g. an incomplete source
+        file for that day) keeps its last known row rather than being
+        dropped, so a bad day's data can't silently erase history.
+        """
         if df is None or df.empty:
             return
-        self._write_csv('SiteDetail', df)
-        logger.info(f"Updated SiteDetail with {len(df)} rows")
+
+        def _norm(v):
+            """Normalize a value for comparison: NaN/None -> '', and
+            21.0 -> '21' so a column that picked up float dtype from an
+            unrelated blank cell doesn't register as 'changed' against an
+            int-typed value meaning the same thing."""
+            if pd.isna(v):
+                return ''
+            s = str(v).strip()
+            try:
+                f = float(s)
+                return str(int(f)) if f.is_integer() else str(f)
+            except (TypeError, ValueError):
+                return s
+
+        target_date = target_date or datetime.now().strftime('%Y-%m-%d')
+        compare_cols = [c for c in SITE_DETAIL_HEADER if c != 'Site Name']
+        final_cols = ['Site Name'] + compare_cols + ['Last Updated']
+
+        new_df = df.set_index('Site Name')
+        existing_df = self._read_csv('SiteDetail')
+
+        if existing_df.empty:
+            out = df.copy()
+            out['Last Updated'] = target_date
+            self._write_csv('SiteDetail', out[final_cols])
+            logger.info(f"📝 Created SiteDetail with {len(out)} sites, Last Updated={target_date}")
+            return
+
+        if 'Last Updated' not in existing_df.columns:
+            # First run under this tracking scheme - no real history to
+            # backfill, so start the clock now rather than fabricate a date.
+            existing_df['Last Updated'] = target_date
+        existing_by_site = existing_df.set_index('Site Name')
+
+        all_sites = list(existing_by_site.index) + [s for s in new_df.index if s not in existing_by_site.index]
+
+        new_count = updated_count = unchanged_count = kept_missing_count = 0
+        rows = []
+        for site in all_sites:
+            if site in new_df.index:
+                new_row = new_df.loc[site]
+                if site in existing_by_site.index:
+                    old_row = existing_by_site.loc[site]
+                    changed = any(_norm(old_row.get(col)) != _norm(new_row.get(col)) for col in compare_cols)
+                    if changed:
+                        row = {col: new_row.get(col) for col in compare_cols}
+                        row['Last Updated'] = target_date
+                        updated_count += 1
+                    else:
+                        row = {col: old_row.get(col) for col in compare_cols}
+                        row['Last Updated'] = old_row.get('Last Updated')
+                        unchanged_count += 1
+                else:
+                    row = {col: new_row.get(col) for col in compare_cols}
+                    row['Last Updated'] = target_date
+                    new_count += 1
+            else:
+                old_row = existing_by_site.loc[site]
+                row = {col: old_row.get(col) for col in compare_cols}
+                row['Last Updated'] = old_row.get('Last Updated')
+                kept_missing_count += 1
+
+            row['Site Name'] = site
+            rows.append(row)
+
+        result_df = pd.DataFrame(rows, columns=final_cols)
+        self._write_csv('SiteDetail', result_df)
+        logger.info(
+            f"🔄 SiteDetail: {new_count} new, {updated_count} changed, {unchanged_count} unchanged, "
+            f"{kept_missing_count} missing-from-today (kept last known) - {len(result_df)} sites total"
+        )
 
     def update_network_kpis(self, results_dict):
         """Update all network KPI CSVs."""

@@ -28,16 +28,25 @@ from backend.cell_kpi_processor import process_cell_kpis
 from backend.traffic_kpi_processor import process_traffic_with_aggregation
 from backend.user_kpi_processor import process_user_kpis, aggregate_user_data
 from backend.site_detail_processor import generate_site_detail, get_latest_available_day
-from backend.health_checker import HealthChecker
 from backend.report_generator import ReportGenerator
 
 # Setup logging
 LOG_FILE = "scheduler.log"
+
+# Windows PowerShell may expose stdout with the legacy cp1252 encoding.  Several
+# pipeline components log Unicode symbols, so use UTF-8 for both the console and
+# the persistent log to prevent logging failures after an otherwise successful
+# run.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -48,7 +57,6 @@ class DailyScheduler:
     def __init__(self):
         self.config = ConfigManager()
         self.history_mgr = CSVHistoryManager()
-        self.health_checker = HealthChecker()
         self.report_gen = ReportGenerator()
         self.today = datetime.now().strftime('%Y-%m-%d')
         self.yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -93,18 +101,15 @@ class DailyScheduler:
             logger.info("💾 Step 8: Exporting to Excel...")
             excel_path = self.history_mgr.export_to_excel()
 
-            # Step 9: Health Check
-            logger.info("🏥 Step 9: Running Health Checks...")
-            health_data = self._run_health_checks()
+            # Step 9: Generate Report (health scoring happens inside report_gen,
+            # computed strictly from target_date's rows in output/csv/)
+            logger.info("📧 Step 9: Generating Report...")
+            report_text, report_excel, report_word = self.report_gen.generate_report(target_date)
 
-            # Step 10: Generate Report
-            logger.info("📧 Step 10: Generating Report...")
-            report_text, report_excel = self._generate_report(health_data, target_date)
-
-            # Step 11: Email (if auto_send)
+            # Step 10: Email (if auto_send)
             if auto_send:
-                logger.info("📧 Step 11: Sending Email Report...")
-                self._send_email(report_text, report_excel)
+                logger.info("📧 Step 10: Sending Email Report...")
+                self._send_email(report_text, report_excel, report_word)
 
             elapsed = time.time() - start_time
             logger.info("=" * 70)
@@ -119,13 +124,22 @@ class DailyScheduler:
             return False
 
     def _download_ftp(self, target_date):
-        """Step 1: Download files from FTP"""
+        """Step 1: Download files from FTP
+
+        Huawei MAE uploads each report at ~05:30 the morning AFTER the day it
+        covers: the file with mtime 2026-08-18 contains the finalized KPIs for
+        2026-08-17. So to get complete data for target_date, we must fetch the
+        file dated target_date + 1 day, not target_date itself.
+        """
         host = self.config.get('host')
         port = self.config.get('port')
         username = self.config.get('username')
         password = self.config.get('password')
         remote_path = self.config.get('remote_path')
         local_root = self.config.get('local_root')
+
+        target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+        ftp_date = (target_dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
         downloader = SFTPDownloader(
             host, port, username, password,
@@ -135,7 +149,7 @@ class DailyScheduler:
 
         try:
             if downloader.connect():
-                result = downloader.download_and_organize(target_date=target_date)
+                result = downloader.download_and_organize(target_date=ftp_date)
                 downloader.disconnect()
                 return result
             return False
@@ -205,145 +219,15 @@ class DailyScheduler:
         if day_folder:
             df = generate_site_detail(day_folder, log_callback=logger.info)
             if df is not None and not df.empty:
-                self.history_mgr.update_site_detail(df)
+                self.history_mgr.update_site_detail(df, target_date=self.yesterday)
 
-    def _run_health_checks(self):
-        """Step 9: Run health checks"""
-        # Load all data from CSVs
-        csv_folder = "output/csv"
-        all_data = {}
-
-        sheets = [
-            '2G_Cell_CSBH', '2G_NWBH', '2G_NW_Daily',
-            '3G_Cell_CSBH', '3G_NWBH', '3G_NW_Daily',
-            '4G_Cell_BH', '4G_NWBH', '4G_NW_Daily'
-        ]
-
-        for sheet in sheets:
-            filepath = os.path.join(csv_folder, f"{sheet}.csv")
-            if os.path.exists(filepath):
-                try:
-                    df = pd.read_csv(filepath)
-                    if not df.empty:
-                        all_data[sheet] = df
-                except:
-                    pass
-
-        # Get health summary
-        health_data = self.health_checker.get_health_summary(all_data, self.yesterday)
-
-        # Get worst cells
-        worst_cells = {}
-        for sheet in ['2G_Cell_CSBH', '3G_Cell_CSBH', '4G_Cell_BH']:
-            if sheet in all_data:
-                tech_map = {
-                    '2G_Cell_CSBH': 'GSM',
-                    '3G_Cell_CSBH': 'UMTS',
-                    '4G_Cell_BH': 'LTE'
-                }
-                tech = tech_map.get(sheet, 'Unknown')
-                df = self.health_checker.find_worst_cells(
-                    all_data[sheet], sheet, n_top=10, selected_date=self.yesterday
-                )
-                if df is not None and not df.empty:
-                    worst_cells[tech] = df
-
-        health_data['worst_cells'] = worst_cells
-        return health_data
-
-    def _generate_report(self, health_data, target_date):
-        """Step 10: Generate report"""
-        # Load metrics
-        metrics = self._load_metrics(target_date)
-        return self.report_gen.generate_report(
-            data={},
-            metrics=metrics,
-            health_summary=health_data,
-            worst_cells=health_data.get('worst_cells', {}),
-            date_str=target_date
-        )
-
-    def _load_metrics(self, target_date):
-        """Load metrics for the target date"""
-        metrics = {}
-
-        # Load User Summary
-        user_file = "output/csv/User_Summary.csv"
-        if os.path.exists(user_file):
-            try:
-                df = pd.read_csv(user_file)
-                row = df[df['Date'] == target_date]
-                if not row.empty:
-                    row = row.iloc[0]
-                    metrics['total_ps_users'] = row.get('Total PS Users', 0)
-                    metrics['cs_subscribers'] = row.get('2G CS user', 0) + row.get('3G CS user', 0)
-                    metrics['volte_users'] = row.get('VoLTE user', 0)
-                    metrics['cs_roaming'] = row.get('Roaming CS (Almadar)', 0)
-                    metrics['lte_max_users'] = row.get('4G PS user', 0)
-            except:
-                pass
-
-        # Load Traffic
-        traffic_files = {
-            '2G': 'Traffic_Network_2G.csv',
-            '3G': 'Traffic_Network_3G.csv',
-            '4G': 'Traffic_Network_4G.csv'
-        }
-
-        total_ps_traffic = 0
-        total_cs_traffic = 0
-        lte_traffic = 0
-
-        for tech, filename in traffic_files.items():
-            filepath = os.path.join("output/csv", filename)
-            if os.path.exists(filepath):
-                try:
-                    df = pd.read_csv(filepath)
-                    row = df[df['Date'] == target_date]
-                    if not row.empty:
-                        row = row.iloc[0]
-                        if tech == '2G':
-                            total_ps_traffic += row.get('2G PS Traffic (GB)', 0)
-                            total_cs_traffic += row.get('2G CS Traffic (Erl)', 0)
-                        elif tech == '3G':
-                            total_ps_traffic += row.get('3G PS Traffic (GB)', 0)
-                            total_cs_traffic += row.get('3G CS Traffic (Erl)', 0)
-                        elif tech == '4G':
-                            lte_traffic = row.get('4G DL Traffic (GB)', 0)
-                            total_ps_traffic += lte_traffic
-                except:
-                    pass
-
-        metrics['total_ps_traffic'] = total_ps_traffic
-        metrics['total_cs_traffic'] = total_cs_traffic
-        metrics['lte_traffic'] = lte_traffic
-
-        # Load 4G NWBH
-        nw_file = "output/csv/4G_NWBH.csv"
-        if os.path.exists(nw_file):
-            try:
-                df = pd.read_csv(nw_file)
-                row = df[df['Date'] == target_date]
-                if not row.empty:
-                    row = row.iloc[0]
-                    metrics['rrc_setup_success'] = row.get('RRC Setup Success Rate(%)', 0)
-                    metrics['erab_setup_success'] = row.get('E-RAB Setup Success Rate', 0)
-                    metrics['service_drop_rate'] = row.get('Service Drop Rate (All)', 0)
-                    metrics['lte_user_throughput'] = row.get('User Downlink Average Throughput (Mbps)', 0)
-                    metrics['volte_cssr'] = row.get('VoLTE Setup Success Rate-ZM(%)', 0)
-                    metrics['network_availability'] = row.get('Radio Network Availability Rate(%)', 0)
-                    metrics['packet_loss'] = row.get('Downlink Packet Loss', 0)
-            except:
-                pass
-
-        return metrics
-
-    def _send_email(self, report_text, report_excel):
+    def _send_email(self, report_text, report_excel, report_word):
         """Step 11: Send email report"""
         # This would use SMTP - placeholder for now
         logger.info("📧 Email sending not implemented yet")
         logger.info(f"Report text: {report_text}")
         logger.info(f"Report Excel: {report_excel}")
+        logger.info(f"Report Word: {report_word}")
 
 
 def main():

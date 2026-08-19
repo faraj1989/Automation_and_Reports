@@ -15,6 +15,17 @@ from backend.site_processor import find_file, extract_physical_name
 
 logger = logging.getLogger(__name__)
 
+# Huawei LTE channel bandwidth encoding (Downlink bandwidth = PRB count) ->
+# actual channel bandwidth in MHz, per 3GPP TS 36.101 Table 5.6-1.
+LTE_BANDWIDTH_MAP = {
+    'CELL_BW_N6': '1.4MHz',
+    'CELL_BW_N15': '3MHz',
+    'CELL_BW_N25': '5MHz',
+    'CELL_BW_N50': '10MHz',
+    'CELL_BW_N75': '15MHz',
+    'CELL_BW_N100': '20MHz',
+}
+
 # Scenario mapping based on cell count
 SCENARIO_MAP = {
     24: 'MM',
@@ -102,6 +113,19 @@ def get_rat(has_2g, has_3g, has_4g):
         return 'L'
     else:
         return ''
+
+
+def _lte_band_label(band_name, cell_rows):
+    """'L1800' -> 'L1800 (20MHz)' using the decoded Downlink bandwidth of the
+    matching cells; if a band's cells carry more than one bandwidth at the
+    same site (unusual but possible), all distinct values are shown."""
+    if cell_rows.empty:
+        return ''
+    if 'Downlink bandwidth' not in cell_rows.columns:
+        return band_name
+    raw_values = cell_rows['Downlink bandwidth'].dropna().astype(str).str.strip().unique()
+    decoded = sorted({LTE_BANDWIDTH_MAP[v] for v in raw_values if v in LTE_BANDWIDTH_MAP})
+    return f"{band_name} ({'/'.join(decoded)})" if decoded else band_name
 
 
 def build_current_rat(row):
@@ -325,28 +349,22 @@ def generate_site_detail(day_folder, log_callback=None):
             site_data = df_4g[df_4g['eNodeB Name'] == site_name]
 
             if not site_data.empty:
-                bands = site_data['Frequency band'].unique()
-                earfcns = site_data['Downlink EARFCN'].unique()
+                site_data = site_data.copy()
+                site_data['_earfcn'] = pd.to_numeric(site_data['Downlink EARFCN'], errors='coerce')
+                site_data['_band'] = pd.to_numeric(site_data['Frequency band'], errors='coerce')
 
-                # L1800 F1 vs F2 detection
-                has_f1 = False
-                has_f2 = False
-                for e in earfcns:
-                    if e is not None:
-                        try:
-                            earfcn = int(e)
-                            if earfcn in [1401, 1875]:
-                                has_f1 = True
-                            elif earfcn in [1250, 1257]:
-                                has_f2 = True
-                        except (ValueError, TypeError):
-                            pass
+                # L1800 F1 vs F2 are the same "Band" value, distinguished only by EARFCN
+                f1_rows = site_data[site_data['_earfcn'].isin([1401, 1875])]
+                f2_rows = site_data[site_data['_earfcn'].isin([1250, 1257])]
+                l2100_rows = site_data[site_data['_band'] == 1]
+                l900_rows = site_data[site_data['_band'] == 8]
+                l700_rows = site_data[site_data['_band'] == 28]
 
-                row['4G L1800 F1 Band'] = 'L1800' if has_f1 else ''
-                row['4G L1800 F2 Band'] = 'L1800' if has_f2 else ''
-                row['4G L2100 Band'] = 'L2100' if any(int(b) == 1 for b in bands if b is not None) else ''
-                row['4G L900 Band'] = 'L900' if any(int(b) == 8 for b in bands if b is not None) else ''
-                row['4G L700 Band'] = 'L700' if any(int(b) == 28 for b in bands if b is not None) else ''
+                row['4G L1800 F1 Band'] = _lte_band_label('L1800', f1_rows)
+                row['4G L1800 F2 Band'] = _lte_band_label('L1800', f2_rows)
+                row['4G L2100 Band'] = _lte_band_label('L2100', l2100_rows)
+                row['4G L900 Band'] = _lte_band_label('L900', l900_rows)
+                row['4G L700 Band'] = _lte_band_label('L700', l700_rows)
 
                 sectors.update(site_data['Cell Name'].unique())
             else:

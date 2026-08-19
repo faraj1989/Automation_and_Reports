@@ -26,6 +26,7 @@ from backend import (
     get_latest_day_folder,
     SITE_SUMMARY_HEADER
 )
+from backend.site_detail_processor import SITE_DETAIL_HEADER
 
 # Try to import tkcalendar
 try:
@@ -33,24 +34,6 @@ try:
     HAS_TKCALENDAR = True
 except ImportError:
     HAS_TKCALENDAR = False
-
-# Site Detail Header
-SITE_DETAIL_HEADER = [
-    'Site Name',
-    '2G GSM900 Band',
-    '2G DCS1800 Band',
-    '3G U2100 Band',
-    '3G U900 Band',
-    '4G L1800 F1 Band',
-    '4G L1800 F2 Band',
-    '4G L2100 Band',
-    '4G L900 Band',
-    '4G L700 Band',
-    'Scenario',
-    'RAT',
-    'Sectors Number',
-    'Current RAT'
-]
 
 
 class LibyanaNPMApp:
@@ -606,7 +589,7 @@ class LibyanaNPMApp:
                         dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                         if len(dates) > 0:
                             date_range = f"{min(dates)} to {max(dates)}"
-                    except:
+                    except Exception:
                         date_range = "N/A"
                 self.user_tree.insert('', 'end', values=(sheet_name, rows, cols, date_range))
             else:
@@ -708,11 +691,11 @@ class LibyanaNPMApp:
             '2G DCS1800 Band': 100,
             '3G U2100 Band': 90,
             '3G U900 Band': 90,
-            '4G L1800 F1 Band': 100,
-            '4G L1800 F2 Band': 100,
-            '4G L2100 Band': 90,
-            '4G L900 Band': 90,
-            '4G L700 Band': 90,
+            '4G L1800 F1 Band': 130,
+            '4G L1800 F2 Band': 130,
+            '4G L2100 Band': 120,
+            '4G L900 Band': 120,
+            '4G L700 Band': 120,
             'Scenario': 100,
             'RAT': 60,
             'Sectors Number': 90,
@@ -1360,7 +1343,7 @@ class LibyanaNPMApp:
                         dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                         if len(dates) > 0:
                             date_range = f"{min(dates)} to {max(dates)}"
-                    except:
+                    except Exception:
                         date_range = "N/A"
                 self.network_tree.insert('', 'end', values=(sheet_name, rows, cols, date_range))
             else:
@@ -1401,7 +1384,7 @@ class LibyanaNPMApp:
                     try:
                         dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                         text += f"  Date Range: {min(dates)} to {max(dates)}\n"
-                    except:
+                    except Exception:
                         pass
                 if 'Date' in df.columns and 'Whole Network' in df.columns:
                     text += f"  Sample dates: {df['Date'].head(3).tolist()}\n"
@@ -1484,7 +1467,7 @@ class LibyanaNPMApp:
                         dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                         if len(dates) > 0:
                             date_range = f"{min(dates)} to {max(dates)}"
-                    except:
+                    except Exception:
                         date_range = "N/A"
                 self.cell_tree.insert('', 'end', values=(sheet_name, rows, cols, date_range))
             else:
@@ -1525,7 +1508,7 @@ class LibyanaNPMApp:
                     try:
                         dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                         text += f"  Date Range: {min(dates)} to {max(dates)}\n"
-                    except:
+                    except Exception:
                         pass
             else:
                 text += f"\n{sheet_name}: No data\n"
@@ -1615,7 +1598,7 @@ class LibyanaNPMApp:
                             dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                             if len(dates) > 0:
                                 date_range = f"{min(dates)} to {max(dates)}"
-                        except:
+                        except Exception:
                             date_range = "N/A"
                     self.traffic_tree.insert('', 'end', values=(type_label, sheet_name, rows, cols, date_range))
                 else:
@@ -1658,7 +1641,7 @@ class LibyanaNPMApp:
                         try:
                             dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
                             text += f"    Date Range: {min(dates)} to {max(dates)}\n"
-                        except:
+                        except Exception:
                             pass
                 else:
                     text += f"  {sheet_name}: No data\n"

@@ -44,6 +44,7 @@ def process_cell_kpis(day_folder, log_callback=None):
     """
     Process all 3 cell KPI files in the day folder.
     Returns a dictionary: sheet_name -> DataFrame
+    Handles: Date normalization, empty row removal, duplicate detection
     """
 
     def log(msg):
@@ -70,17 +71,29 @@ def process_cell_kpis(day_folder, log_callback=None):
             try:
                 df = read_csv_skip_metadata(file_path)
                 if df is not None and not df.empty:
-                    # Convert Date column to string for consistency
+                    rows_before = len(df)
+                    
+                    # 1. Remove completely empty rows
+                    df = df.dropna(how='all')
+                    empty_rows_removed = rows_before - len(df)
+                    if empty_rows_removed > 0:
+                        log(f"   🗑️  Removed {empty_rows_removed} completely empty rows")
+                    
+                    # 2. Normalize Date column to YYYY-MM-DD format
                     if 'Date' in df.columns:
-                        df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+                        try:
+                            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                            log(f"   ✅ Normalized dates to YYYY-MM-DD format")
+                        except Exception as e:
+                            log(f"   ⚠️ Could not normalize dates: {e}")
 
-                    # Remove duplicates within the file
+                    # 3. Remove duplicates within the file
                     key_cols = config.get('key_columns', ['Date'])
                     available_keys = [col for col in key_cols if col in df.columns]
                     if available_keys:
                         dup_count = df.duplicated(subset=available_keys).sum()
                         if dup_count > 0:
-                            log(f"   ⚠️ Found {dup_count} duplicate rows, removing")
+                            log(f"   ⚠️ Found {dup_count} duplicate rows by {available_keys}, removing")
                             df = df.drop_duplicates(subset=available_keys)
 
                     results[sheet_name] = df

@@ -28,3 +28,7 @@ python-dotenv>=1.0.0  # For environment variables (SMTP passwords)
 # For PDF generation (optional)
 # reportlab>=4.0.0
 # fpdf2>=2.7.0
+
+# Word report (copy-paste ready .docx, with embedded trend charts)
+python-docx>=1.1.0
+matplotlib>=3.8.0

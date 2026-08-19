@@ -137,7 +137,7 @@ class HealthChecker:
 
             # Calculate average for cell-level
             if aggregation != 'Whole Network' and 'Cell' in aggregation:
-                avg_value = values.mean()
+                avg_value = pd.to_numeric(values, errors='coerce').mean()
             else:
                 # For whole network, use the single value
                 avg_value = values.iloc[0] if not values.empty else None
@@ -272,9 +272,13 @@ class HealthChecker:
 
         Severity Score = (Sum of (Fail weight * 10)) + (Number of violations * 5)
 
-        Returns DataFrame with columns:
-        Rank, Technology, Cell Name, Severity Score,
-        Accessibility, Retainability, Mobility, Congestion, Failing KPIs
+        Vectorized across all cells at once (single groupby-mean + vectorized
+        threshold comparisons per KPI column) instead of a per-cell Python
+        loop - cell sheets have thousands of cells, and the old approach
+        (filter-per-cell, then iterrows() per KPI per cell) took minutes.
+
+        Returns DataFrame with columns: Rank, Technology, Cell Name,
+        Severity Score, Failing KPIs.
         """
         if df is None or df.empty or self.thresholds is None:
             return pd.DataFrame()
@@ -282,8 +286,8 @@ class HealthChecker:
         # Filter by date if provided
         if selected_date and date_col in df.columns:
             target_date = self.normalize_date(selected_date)
-            df['_norm_date'] = df[date_col].apply(self.normalize_date)
-            df = df[df['_norm_date'] == target_date]
+            norm_dates = pd.to_datetime(df[date_col], errors='coerce').dt.strftime('%Y-%m-%d')
+            df = df[norm_dates == target_date]
 
         if df.empty:
             return pd.DataFrame()
@@ -298,108 +302,90 @@ class HealthChecker:
 
         # Identify cell column name
         cell_col = None
-        if 'Cell Name' in df.columns:
-            cell_col = 'Cell Name'
-        elif 'Site Name' in df.columns:
-            cell_col = 'Site Name'
-        elif 'NodeB Name' in df.columns:
-            cell_col = 'NodeB Name'
-        elif 'eNodeB Name' in df.columns:
-            cell_col = 'eNodeB Name'
+        for candidate in ('Cell Name', 'Site Name', 'NodeB Name', 'eNodeB Name'):
+            if candidate in df.columns:
+                cell_col = candidate
+                break
 
         if cell_col is None:
             return pd.DataFrame()
 
-        # Group by cell
-        cells = df[cell_col].unique()
+        kpi_defs = [r for _, r in sheet_thresholds.iterrows() if r['Column_Name'] in df.columns]
+        if not kpi_defs:
+            return pd.DataFrame()
+
+        kpi_cols = [r['Column_Name'] for r in kpi_defs]
+        numeric = df[[cell_col] + kpi_cols].copy()
+        for col in set(kpi_cols):
+            numeric[col] = pd.to_numeric(numeric[col], errors='coerce')
+
+        # One vectorized groupby-mean for every cell x KPI at once (matches
+        # the original semantics of averaging duplicate rows per cell/date).
+        agg = numeric.groupby(cell_col, sort=False)[kpi_cols].mean()
+        if agg.empty:
+            return pd.DataFrame()
+
+        tech = sheet_thresholds['Technology'].iloc[0]
+
+        fail_masks: Dict[str, pd.Series] = {}
+        weights: Dict[str, float] = {}
+
+        for r in kpi_defs:
+            col = r['Column_Name']
+            kpi_name = r['KPI_Name']
+            threshold = float(r['Threshold'])
+            operator = r['Operator']
+            weights[kpi_name] = float(r['Weight'])
+            vals = agg[col]
+            has_data = vals.notna()
+
+            if operator == '>=':
+                passed = vals >= threshold
+            elif operator == '<=':
+                passed = vals <= threshold
+            elif operator == '>':
+                passed = vals > threshold
+            elif operator == '<':
+                passed = vals < threshold
+            else:
+                passed = pd.Series(False, index=agg.index)  # unknown operator -> always fails
+
+            fail_masks[kpi_name] = has_data & ~passed
+
+        fail_df = pd.DataFrame(fail_masks)
+        weight_series = pd.Series(weights)
+
+        severity = fail_df.mul(weight_series, axis=1).sum(axis=1) * 10 + fail_df.sum(axis=1) * 5
+        severity = severity[fail_df.any(axis=1)]
+        if severity.empty:
+            return pd.DataFrame()
+
+        # Stable sort so ties keep their original (first-seen) cell order.
+        top_cells = severity.sort_values(ascending=False, kind='mergesort').head(n_top)
+
+        # Failing-KPI detail text is only needed for the top N cells, not
+        # every cell in the sheet - build it here, cheaply.
         results = []
+        for cell, score in top_cells.items():
+            labels = []
+            for r in kpi_defs:
+                kpi_name = r['KPI_Name']
+                if fail_masks[kpi_name].get(cell, False):
+                    val = agg.loc[cell, r['Column_Name']]
+                    labels.append(f"{kpi_name} ({val:.2f} | Fail)")
+            fail_str = ', '.join(labels[:3])
+            if len(labels) > 3:
+                fail_str += f" +{len(labels) - 3} more"
 
-        for cell in cells:
-            cell_data = df[df[cell_col] == cell]
-            severity_score = 0
-            violations = []
-            kpi_values = {}
+            results.append({
+                'Technology': tech,
+                'Cell Name': cell,
+                'Severity Score': score,
+                'Failing KPIs': fail_str,
+            })
 
-            # Check each KPI for this cell
-            for _, row in sheet_thresholds.iterrows():
-                kpi_name = row['KPI_Name']
-                column = row['Column_Name']
-                threshold = row['Threshold']
-                operator = row['Operator']
-                weight = row['Weight']
-                dimension = row['Dimension']
-                tech = row['Technology']
-
-                if column not in cell_data.columns:
-                    continue
-
-                # Get value (average across rows for this cell)
-                value = cell_data[column].mean()
-
-                if pd.isna(value):
-                    continue
-
-                # Store value for display
-                kpi_values[kpi_name] = value
-                kpi_values[f'{kpi_name}_pass'] = True
-
-                # Check threshold
-                passed, status = self.check_kpi(value, threshold, operator)
-
-                if not passed:
-                    severity_score += (weight * 10) + 5
-                    violations.append({
-                        'kpi': kpi_name,
-                        'value': value,
-                        'threshold': threshold,
-                        'weight': weight,
-                        'dimension': dimension,
-                        'status': status
-                    })
-                    kpi_values[f'{kpi_name}_pass'] = False
-
-            if violations:
-                # Determine technology
-                tech = row.get('Technology', 'Unknown') if 'row' in locals() else 'Unknown'
-
-                # Get dimension-specific values (Golden 5)
-                acc_val = kpi_values.get('Call Setup Success Rate(%)' if tech == 'GSM' else
-                                         'RRC Setup Success Ratio_EFD' if tech == 'UMTS' else
-                                         'RRC Setup Success Rate(%)', 'N/A')
-                ret_val = kpi_values.get('TCH Drop Rate(%)' if tech == 'GSM' else
-                                         'CS Call Drop Rate(%)' if tech == 'UMTS' else
-                                         'Service Drop Rate (All)', 'N/A')
-                mob_val = kpi_values.get('Handover Success Rate(%)' if tech == 'GSM' else
-                                         'Soft Handover Success Rate(%)' if tech == 'UMTS' else
-                                         'Intra-HO execute Success Rate', 'N/A')
-                con_val = kpi_values.get('TCH Congestion Rate(%)' if tech == 'GSM' else
-                                         'PS RAB Setup Success Ratio_EFD' if tech == 'UMTS' else
-                                         'DL PRB Utilizing Rate(%)', 'N/A')
-
-                # Build failing KPIs string
-                fail_str = ', '.join([f"{v['kpi']} ({v['value']:.2f} | Fail)" for v in violations[:3]])
-                if len(violations) > 3:
-                    fail_str += f" +{len(violations) - 3} more"
-
-                results.append({
-                    'Technology': tech,
-                    'Cell Name': cell,
-                    'Severity Score': severity_score,
-                    'Accessibility': acc_val,
-                    'Retainability': ret_val,
-                    'Mobility': mob_val,
-                    'Congestion': con_val,
-                    'Failing KPIs': fail_str,
-                    'Violations': violations
-                })
-
-        # Sort by severity score (highest first)
-        results.sort(key=lambda x: x['Severity Score'], reverse=True)
-
-        # Return top N
-        df_results = pd.DataFrame(results[:n_top])
-        if not df_results.empty:
-            df_results.insert(0, 'Rank', range(1, len(df_results) + 1))
+        df_results = pd.DataFrame(results)
+        df_results.insert(0, 'Rank', range(1, len(df_results) + 1))
 
         return df_results
 
