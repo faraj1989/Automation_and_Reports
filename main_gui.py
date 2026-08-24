@@ -83,6 +83,12 @@ class LibyanaNPMApp:
         self.cell_results = None
         self.cell_day = None
 
+        self.transmission_results = None
+        self.transmission_day = None
+
+        self.hourly_cell_results = None
+        self.hourly_cell_day = None
+
         # Traffic KPIs variables
         self.traffic_results = None
         self.traffic_day = None
@@ -134,22 +140,32 @@ class LibyanaNPMApp:
         self.notebook.add(self.cell_tab, text="📊 Cell KPIs")
         self._build_cell_kpi_tab()
 
-        # Tab 5: Traffic KPIs
+        # Tab 5: Transmission KPIs
+        self.transmission_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.transmission_tab, text="📡 Transmission KPIs")
+        self._build_transmission_kpi_tab()
+
+        # Tab 6: Hourly Cells (live monitoring)
+        self.hourly_cell_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.hourly_cell_tab, text="📶 Hourly Cells")
+        self._build_hourly_cell_tab()
+
+        # Tab 7: Traffic KPIs
         self.traffic_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.traffic_tab, text="📊 Traffic KPIs")
         self._build_traffic_kpi_tab()
 
-        # Tab 6: User KPIs (NEW)
+        # Tab 8: User KPIs (NEW)
         self.user_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.user_tab, text="👥 User KPIs")
         self._build_user_kpi_tab()
 
-        # Tab 7: Site Detail
+        # Tab 9: Site Detail
         self.detail_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.detail_tab, text="📋 Site Detail")
         self._build_detail_tab()
 
-        # Tab 8: Log Output
+        # Tab 10: Log Output
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📋 Log Output")
         self._build_log_tab()
@@ -354,6 +370,126 @@ class LibyanaNPMApp:
 
         self.cell_status = tk.StringVar(value="Ready - Click 'Process Cell KPIs'")
         status_label = ttk.Label(main_frame, textvariable=self.cell_status, foreground='gray')
+        status_label.pack(anchor=tk.W, pady=5)
+
+    # ---------- Transmission KPIs Tab ----------
+    def _build_transmission_kpi_tab(self):
+        """Build the Transmission KPIs tab."""
+        main_frame = ttk.Frame(self.transmission_tab, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        info_frame = ttk.LabelFrame(main_frame, text="Information", padding="10")
+        info_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(info_frame, text="Processes IUB (3G NodeB<->RNC) and ABIS (2G BTS<->BSC) backhaul "
+                                    "ping delay/packet-loss, aggregated to one row per link per day.").pack(anchor=tk.W)
+        ttk.Label(info_frame, text="File: site_BSC6900_kpI_PACKETLOSS", foreground='gray').pack(anchor=tk.W)
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Button(btn_frame, text="🔍 Process Transmission KPIs", command=self._run_transmission_kpis).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="💾 Save to Excel", command=self._save_transmission_kpis).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="📋 Copy to Clipboard", command=self._copy_transmission_kpis).pack(side=tk.LEFT, padx=5)
+
+        result_frame = ttk.LabelFrame(main_frame, text="Transmission KPI Results", padding="10")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        tree_container = ttk.Frame(result_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+
+        v_scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        h_scrollbar = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.transmission_tree = ttk.Treeview(
+            tree_container,
+            columns=('Sheet', 'Rows', 'Columns', 'Date Range'),
+            show='headings',
+            yscrollcommand=v_scrollbar.set,
+            xscrollcommand=h_scrollbar.set,
+            height=10
+        )
+        self.transmission_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        v_scrollbar.config(command=self.transmission_tree.yview)
+        h_scrollbar.config(command=self.transmission_tree.xview)
+
+        self.transmission_tree.heading('Sheet', text='Sheet Name')
+        self.transmission_tree.heading('Rows', text='Rows')
+        self.transmission_tree.heading('Columns', text='Columns')
+        self.transmission_tree.heading('Date Range', text='Date Range')
+
+        self.transmission_tree.column('Sheet', width=150)
+        self.transmission_tree.column('Rows', width=80)
+        self.transmission_tree.column('Columns', width=80)
+        self.transmission_tree.column('Date Range', width=200)
+
+        self.transmission_status = tk.StringVar(value="Ready - Click 'Process Transmission KPIs'")
+        status_label = ttk.Label(main_frame, textvariable=self.transmission_status, foreground='gray')
+        status_label.pack(anchor=tk.W, pady=5)
+
+    # ---------- Hourly Cells Tab ----------
+    def _build_hourly_cell_tab(self):
+        """Build the Hourly Cells (live monitoring) tab."""
+        main_frame = ttk.Frame(self.hourly_cell_tab, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        info_frame = ttk.LabelFrame(main_frame, text="Information", padding="10")
+        info_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(info_frame, text="Processes the hourly \"all last hours all cells level\" report "
+                                    "(2G/3G/4G, cell-level, hourly) for live/near-term monitoring.").pack(anchor=tk.W)
+        ttk.Label(info_frame, text="Keeps the last 14 days of hourly detail; meant to run on its own "
+                                    "~6-hourly schedule (scheduler.py --hourly-cells), separate from the "
+                                    "once-daily pipeline.", foreground='gray').pack(anchor=tk.W)
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Button(btn_frame, text="🔍 Process Hourly Cells", command=self._run_hourly_cells).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="💾 Save to Excel", command=self._save_hourly_cells).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="📋 Copy to Clipboard", command=self._copy_hourly_cells).pack(side=tk.LEFT, padx=5)
+
+        result_frame = ttk.LabelFrame(main_frame, text="Hourly Cells Results", padding="10")
+        result_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        tree_container = ttk.Frame(result_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+
+        v_scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        h_scrollbar = ttk.Scrollbar(tree_container, orient=tk.HORIZONTAL)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.hourly_cell_tree = ttk.Treeview(
+            tree_container,
+            columns=('Sheet', 'Rows', 'Columns', 'Date Range'),
+            show='headings',
+            yscrollcommand=v_scrollbar.set,
+            xscrollcommand=h_scrollbar.set,
+            height=10
+        )
+        self.hourly_cell_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        v_scrollbar.config(command=self.hourly_cell_tree.yview)
+        h_scrollbar.config(command=self.hourly_cell_tree.xview)
+
+        self.hourly_cell_tree.heading('Sheet', text='Sheet Name')
+        self.hourly_cell_tree.heading('Rows', text='Rows')
+        self.hourly_cell_tree.heading('Columns', text='Columns')
+        self.hourly_cell_tree.heading('Date Range', text='Date Range')
+
+        self.hourly_cell_tree.column('Sheet', width=150)
+        self.hourly_cell_tree.column('Rows', width=80)
+        self.hourly_cell_tree.column('Columns', width=80)
+        self.hourly_cell_tree.column('Date Range', width=200)
+
+        self.hourly_cell_status = tk.StringVar(value="Ready - Click 'Process Hourly Cells'")
+        status_label = ttk.Label(main_frame, textvariable=self.hourly_cell_status, foreground='gray')
         status_label.pack(anchor=tk.W, pady=5)
 
     # ---------- Traffic KPIs Tab ----------
@@ -1517,6 +1653,252 @@ class LibyanaNPMApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.cell_status.set("Copied to clipboard!")
+
+    # ---------- Transmission KPI Methods ----------
+    def _run_transmission_kpis(self):
+        """Process transmission KPIs from the selected day."""
+        self._log_to_console("🔍 Process Transmission KPIs clicked")
+        self.transmission_status.set("Processing...")
+        self._log("▶ Processing transmission KPIs...", 'info')
+        self._run_thread(self._do_process_transmission_kpis)
+
+    def _do_process_transmission_kpis(self):
+        """Run the actual transmission KPI processing."""
+        try:
+            from backend.transmission_kpi_processor import process_transmission_kpis
+            from backend.site_detail_processor import get_latest_available_day
+
+            local_root = self.local_root_var.get().strip()
+            latest_folder = get_latest_available_day(local_root, log_callback=self._log)
+
+            if not latest_folder:
+                self._log("❌ No data available", 'error')
+                self.transmission_status.set("Error - No data available")
+                return
+
+            self.transmission_day = os.path.basename(os.path.dirname(latest_folder))
+            self._log(f"📁 Using day: {self.transmission_day}")
+
+            results = process_transmission_kpis(latest_folder, log_callback=self._log)
+
+            if not results:
+                self._log("❌ No transmission KPI data found", 'error')
+                self.transmission_status.set("Error - No data")
+                return
+
+            self.transmission_results = results
+            self.root.after(0, self._update_transmission_tree, results)
+
+            # Save to CSV using CSVHistoryManager
+            self.history_mgr.update_transmission_kpis(results)
+            self._log("✅ Transmission KPIs saved to CSV", 'success')
+
+            total_rows = sum(len(df) for df in results.values() if df is not None and not df.empty)
+            total_sheets = sum(1 for df in results.values() if df is not None and not df.empty)
+
+            self.transmission_status.set(
+                f"Ready - {total_sheets} sheets, {total_rows} rows processed for {self.transmission_day}")
+
+        except Exception as e:
+            self._log_to_console(f"❌ Error processing transmission KPIs: {e}")
+            import traceback
+            self._log_to_console(traceback.format_exc())
+            self._log(f"❌ Error: {e}", 'error')
+            self.transmission_status.set("Error")
+
+    def _update_transmission_tree(self, results):
+        """Update the treeview with transmission KPI results."""
+        for item in self.transmission_tree.get_children():
+            self.transmission_tree.delete(item)
+
+        total_rows = 0
+        total_sheets = 0
+
+        for sheet_name, df in results.items():
+            if df is not None and not df.empty:
+                rows = len(df)
+                cols = len(df.columns)
+                total_rows += rows
+                total_sheets += 1
+                date_range = ""
+                if 'Date' in df.columns:
+                    try:
+                        dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
+                        if len(dates) > 0:
+                            date_range = f"{min(dates)} to {max(dates)}"
+                    except Exception:
+                        date_range = "N/A"
+                self.transmission_tree.insert('', 'end', values=(sheet_name, rows, cols, date_range))
+            else:
+                self.transmission_tree.insert('', 'end', values=(sheet_name, 'No data', '-', '-'))
+
+        self.transmission_tree.insert('', 'end', values=('-' * 20, '-' * 20, '-' * 20, '-' * 20))
+        self.transmission_tree.insert('', 'end', values=('TOTAL', total_rows, total_sheets, ''))
+
+    def _save_transmission_kpis(self):
+        """Save transmission KPI results to CSV/Excel."""
+        if self.transmission_results is None:
+            messagebox.showwarning("No Data", "Please process transmission KPIs first.")
+            return
+
+        try:
+            self.history_mgr.update_transmission_kpis(self.transmission_results)
+            excel_path = self.history_mgr.export_to_excel()
+            self._log("✅ Transmission KPIs saved to CSV and Excel", 'success')
+            messagebox.showinfo("Saved", f"Transmission KPIs saved to:\n{excel_path if excel_path else 'CSV files'}")
+        except Exception as e:
+            self._log(f"❌ Error saving: {e}", 'error')
+            messagebox.showerror("Error", f"Failed to save: {e}")
+
+    def _copy_transmission_kpis(self):
+        """Copy transmission KPI summary to clipboard."""
+        if self.transmission_results is None:
+            messagebox.showwarning("No Data", "Please process transmission KPIs first.")
+            return
+
+        text = f"Transmission KPIs - {self.transmission_day}\n"
+        text += "=" * 60 + "\n"
+
+        for sheet_name, df in self.transmission_results.items():
+            if df is not None and not df.empty:
+                text += f"\n{sheet_name}:\n"
+                text += f"  Rows: {len(df)}, Columns: {len(df.columns)}\n"
+                if 'Date' in df.columns:
+                    try:
+                        dates = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d').unique()
+                        text += f"  Date Range: {min(dates)} to {max(dates)}\n"
+                    except Exception:
+                        pass
+            else:
+                text += f"\n{sheet_name}: No data\n"
+
+        text += "\n" + "=" * 60
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.transmission_status.set("Copied to clipboard!")
+
+    # ---------- Hourly Cells Methods ----------
+    def _run_hourly_cells(self):
+        """Process the hourly all-cells report from the latest day folder."""
+        self._log_to_console("🔍 Process Hourly Cells clicked")
+        self.hourly_cell_status.set("Processing... (large files, may take a minute)")
+        self._log("▶ Processing hourly cells...", 'info')
+        self._run_thread(self._do_process_hourly_cells)
+
+    def _do_process_hourly_cells(self):
+        """Run the actual hourly cells processing."""
+        try:
+            from backend.hourly_cell_processor import process_hourly_cell_kpis
+            from backend.site_detail_processor import get_latest_available_day
+
+            local_root = self.local_root_var.get().strip()
+            latest_folder = get_latest_available_day(local_root, log_callback=self._log)
+
+            if not latest_folder:
+                self._log("❌ No data available", 'error')
+                self.hourly_cell_status.set("Error - No data available")
+                return
+
+            self.hourly_cell_day = os.path.basename(os.path.dirname(latest_folder))
+            self._log(f"📁 Using day: {self.hourly_cell_day}")
+
+            results = process_hourly_cell_kpis(latest_folder, log_callback=self._log)
+
+            if not results:
+                self._log("❌ No hourly cells data found", 'error')
+                self.hourly_cell_status.set("Error - No data")
+                return
+
+            self.hourly_cell_results = results
+            self.root.after(0, self._update_hourly_cell_tree, results)
+
+            # Save to CSV using CSVHistoryManager (14-day retention, vectorized dedup)
+            self.history_mgr.update_hourly_cell_kpis(results)
+            self._log("✅ Hourly Cells saved to CSV", 'success')
+
+            total_rows = sum(len(df) for df in results.values() if df is not None and not df.empty)
+            total_sheets = sum(1 for df in results.values() if df is not None and not df.empty)
+
+            self.hourly_cell_status.set(
+                f"Ready - {total_sheets} sheets, {total_rows} rows processed for {self.hourly_cell_day}")
+
+        except Exception as e:
+            self._log_to_console(f"❌ Error processing hourly cells: {e}")
+            import traceback
+            self._log_to_console(traceback.format_exc())
+            self._log(f"❌ Error: {e}", 'error')
+            self.hourly_cell_status.set("Error")
+
+    def _update_hourly_cell_tree(self, results):
+        """Update the treeview with hourly cells results."""
+        for item in self.hourly_cell_tree.get_children():
+            self.hourly_cell_tree.delete(item)
+
+        total_rows = 0
+        total_sheets = 0
+
+        for sheet_name, df in results.items():
+            if df is not None and not df.empty:
+                rows = len(df)
+                cols = len(df.columns)
+                total_rows += rows
+                total_sheets += 1
+                date_range = ""
+                if 'Time' in df.columns:
+                    try:
+                        times = df['Time'].dropna().unique()
+                        if len(times) > 0:
+                            date_range = f"{min(times)} to {max(times)}"
+                    except Exception:
+                        date_range = "N/A"
+                self.hourly_cell_tree.insert('', 'end', values=(sheet_name, rows, cols, date_range))
+            else:
+                self.hourly_cell_tree.insert('', 'end', values=(sheet_name, 'No data', '-', '-'))
+
+        self.hourly_cell_tree.insert('', 'end', values=('-' * 20, '-' * 20, '-' * 20, '-' * 20))
+        self.hourly_cell_tree.insert('', 'end', values=('TOTAL', total_rows, total_sheets, ''))
+
+    def _save_hourly_cells(self):
+        """Save hourly cells results to CSV/Excel."""
+        if self.hourly_cell_results is None:
+            messagebox.showwarning("No Data", "Please process hourly cells first.")
+            return
+
+        try:
+            self.history_mgr.update_hourly_cell_kpis(self.hourly_cell_results)
+            excel_path = self.history_mgr.export_to_excel()
+            self._log("✅ Hourly Cells saved to CSV and Excel", 'success')
+            messagebox.showinfo("Saved", f"Hourly Cells saved to:\n{excel_path if excel_path else 'CSV files'}")
+        except Exception as e:
+            self._log(f"❌ Error saving: {e}", 'error')
+            messagebox.showerror("Error", f"Failed to save: {e}")
+
+    def _copy_hourly_cells(self):
+        """Copy hourly cells summary to clipboard."""
+        if self.hourly_cell_results is None:
+            messagebox.showwarning("No Data", "Please process hourly cells first.")
+            return
+
+        text = f"Hourly Cells - {self.hourly_cell_day}\n"
+        text += "=" * 60 + "\n"
+
+        for sheet_name, df in self.hourly_cell_results.items():
+            if df is not None and not df.empty:
+                text += f"\n{sheet_name}:\n"
+                text += f"  Rows: {len(df)}, Columns: {len(df.columns)}\n"
+                if 'Time' in df.columns:
+                    try:
+                        times = df['Time'].dropna().unique()
+                        text += f"  Time Range: {min(times)} to {max(times)}\n"
+                    except Exception:
+                        pass
+            else:
+                text += f"\n{sheet_name}: No data\n"
+
+        text += "\n" + "=" * 60
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.hourly_cell_status.set("Copied to clipboard!")
 
     # ---------- Traffic KPI Methods ----------
     def _run_traffic_kpis(self):

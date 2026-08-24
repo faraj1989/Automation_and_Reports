@@ -29,6 +29,12 @@ from backend.cell_kpi_processor import (
     process_cell_kpis,
     get_cell_kpi_summary
 )
+from backend.transmission_kpi_processor import (
+    process_transmission_kpis
+)
+from backend.hourly_cell_processor import (
+    process_hourly_cell_kpis
+)
 from backend.traffic_kpi_processor import (
     process_traffic_kpis,
     process_traffic_with_aggregation,

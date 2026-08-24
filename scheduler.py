@@ -25,6 +25,8 @@ from backend import (
 from backend.csv_history_manager import CSVHistoryManager
 from backend.network_kpi_processor import process_network_kpis
 from backend.cell_kpi_processor import process_cell_kpis
+from backend.transmission_kpi_processor import process_transmission_kpis
+from backend.hourly_cell_processor import process_hourly_cell_kpis
 from backend.traffic_kpi_processor import process_traffic_with_aggregation
 from backend.user_kpi_processor import process_user_kpis, aggregate_user_data
 from backend.site_detail_processor import generate_site_detail, get_latest_available_day
@@ -88,27 +90,30 @@ class DailyScheduler:
             logger.info("📊 Step 4: Processing Cell KPIs...")
             self._process_cell_kpis()
 
-            logger.info("📊 Step 5: Processing Traffic KPIs...")
+            logger.info("📡 Step 5: Processing Transmission KPIs...")
+            self._process_transmission_kpis()
+
+            logger.info("📊 Step 6: Processing Traffic KPIs...")
             self._process_traffic_kpis()
 
-            logger.info("👥 Step 6: Processing User KPIs...")
+            logger.info("👥 Step 7: Processing User KPIs...")
             self._process_user_kpis()
 
-            logger.info("📋 Step 7: Generating Site Detail...")
+            logger.info("📋 Step 8: Generating Site Detail...")
             self._process_site_detail()
 
-            # Step 8: Export to Excel
-            logger.info("💾 Step 8: Exporting to Excel...")
+            # Step 9: Export to Excel
+            logger.info("💾 Step 9: Exporting to Excel...")
             excel_path = self.history_mgr.export_to_excel()
 
-            # Step 9: Generate Report (health scoring happens inside report_gen,
+            # Step 10: Generate Report (health scoring happens inside report_gen,
             # computed strictly from target_date's rows in output/csv/)
-            logger.info("📧 Step 9: Generating Report...")
+            logger.info("📧 Step 10: Generating Report...")
             report_text, report_excel, report_word = self.report_gen.generate_report(target_date)
 
-            # Step 10: Email (if auto_send)
+            # Step 11: Email (if auto_send)
             if auto_send:
-                logger.info("📧 Step 10: Sending Email Report...")
+                logger.info("📧 Step 11: Sending Email Report...")
                 self._send_email(report_text, report_excel, report_word)
 
             elapsed = time.time() - start_time
@@ -188,6 +193,16 @@ class DailyScheduler:
             if results:
                 self.history_mgr.update_cell_kpis(results)
 
+    def _process_transmission_kpis(self):
+        """Step 5: Process Transmission KPIs (IUB/ABIS packet loss + latency)"""
+        local_root = self.config.get('local_root')
+        day_folder = get_latest_day_folder(local_root)
+
+        if day_folder:
+            results = process_transmission_kpis(day_folder, log_callback=logger.info)
+            if results:
+                self.history_mgr.update_transmission_kpis(results)
+
     def _process_traffic_kpis(self):
         """Step 5: Process Traffic KPIs"""
         local_root = self.config.get('local_root')
@@ -229,14 +244,89 @@ class DailyScheduler:
         logger.info(f"Report Excel: {report_excel}")
         logger.info(f"Report Word: {report_word}")
 
+    # ------------------------------------------------------------------
+    # Hourly cells update - lightweight, independently-schedulable path.
+    # Separate from run() because scheduler.py has no internal interval
+    # loop (it's a one-shot CLI triggered once/day externally); re-running
+    # the whole daily pipeline every ~6 hours would redundantly re-score
+    # and re-email. This is meant to be pointed at by its own scheduled
+    # task, every ~6 hours, independent of the once-daily run().
+    # ------------------------------------------------------------------
+
+    def _download_latest_ftp_files(self):
+        """Fetch whatever's newest on the FTP server right now, no date
+        filter - unlike _download_ftp's "yesterday's finalized report"
+        day-offset logic, the hourly all-cells report is a live rolling
+        window, so there's no target day to offset against."""
+        host = self.config.get('host')
+        port = self.config.get('port')
+        username = self.config.get('username')
+        password = self.config.get('password')
+        remote_path = self.config.get('remote_path')
+        local_root = self.config.get('local_root')
+
+        downloader = SFTPDownloader(
+            host, port, username, password,
+            remote_path, local_root,
+            log_callback=logger.info
+        )
+        try:
+            if downloader.connect():
+                result = downloader.download_and_organize()
+                downloader.disconnect()
+                return result
+            return False
+        except Exception as e:
+            logger.error(f"FTP download failed: {e}")
+            return False
+
+    def _process_hourly_cells(self):
+        """Process the hourly all-cells report (2G/3G/4G live cell KPIs)."""
+        local_root = self.config.get('local_root')
+        day_folder = get_latest_day_folder(local_root)
+
+        if day_folder:
+            results = process_hourly_cell_kpis(day_folder, log_callback=logger.info)
+            if results:
+                self.history_mgr.update_hourly_cell_kpis(results)
+
+    def run_hourly_cells_update(self):
+        """Entry point for the ~6-hourly scheduled task: fetch whatever's
+        new on the FTP and archive the hourly all-cells report."""
+        logger.info("=" * 70)
+        logger.info("📶 STARTING HOURLY CELLS UPDATE")
+        logger.info("=" * 70)
+        start_time = time.time()
+
+        try:
+            self._download_latest_ftp_files()
+            self._process_hourly_cells()
+
+            elapsed = time.time() - start_time
+            logger.info("=" * 70)
+            logger.info(f"✅ HOURLY CELLS UPDATE COMPLETED - {elapsed:.1f} seconds")
+            logger.info("=" * 70)
+            return True
+        except Exception as e:
+            logger.error(f"❌ Hourly cells update failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
 
 def main():
     parser = argparse.ArgumentParser(description='Libyana NPM Daily Scheduler')
     parser.add_argument('--date', help='Target date (YYYY-MM-DD)', default=None)
     parser.add_argument('--auto-send', action='store_true', help='Auto-send email')
+    parser.add_argument('--hourly-cells', action='store_true',
+                         help='Run only the ~6-hourly live cell KPI update, not the full daily pipeline')
     args = parser.parse_args()
 
     scheduler = DailyScheduler()
+
+    if args.hourly_cells:
+        scheduler.run_hourly_cells_update()
+        return
 
     if args.date:
         target_date = args.date

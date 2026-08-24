@@ -23,6 +23,7 @@ from backend.report_generator import (
     ReportGenerator, TECH_LABELS, CELL_SHEETS, SCORECARD_SHEETS, SITE_COL_BY_TECH,
 )
 from backend import ept_manager as ept
+from backend.special_reports_processor import build_nq_template_report
 
 st.set_page_config(page_title="Libyana Network Dashboard", page_icon="📊", layout="wide")
 
@@ -127,6 +128,23 @@ def cached_excel_bytes(target_date, previous_date):
     )
     with open(path, 'rb') as f:
         return f.read()
+
+
+@st.cache_data(ttl=600)
+def cached_nq_template():
+    return build_nq_template_report()
+
+
+@st.cache_data(ttl=600)
+def cached_nq_template_bytes():
+    import io
+    sheets = cached_nq_template()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        for sheet_name, df in sheets.items():
+            if df is not None and not df.empty:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return buf.getvalue()
 
 
 @st.cache_data(ttl=600)
@@ -290,7 +308,7 @@ with st.sidebar:
     section = st.radio(
         "Section",
         ["📊 Overview", "📡 KPIs & Performance", "🏗️ Sites & Infrastructure",
-         "🔎 Investigate", "📧 Reports"],
+         "🔎 Investigate", "📋 HQ Reports", "📧 Reports"],
         key="nav_section", label_visibility="collapsed",
     )
 
@@ -356,6 +374,17 @@ if section == "📊 Overview":
             st.dataframe(combined, width='stretch', hide_index=True)
         else:
             st.info("No cells flagged.")
+
+        st.subheader("Failing Network KPIs (Busy Hour)")
+        alerts = health.get('alerts', [])
+        if alerts:
+            alerts_df = pd.DataFrame(alerts).rename(columns={
+                'kpi': 'KPI Name', 'tech': 'Technology', 'value': "Today's Value",
+                'threshold': 'Threshold', 'possible_cause': 'Possible Cause', 'severity': 'Severity',
+            })
+            st.dataframe(alerts_df, width='stretch', hide_index=True)
+        else:
+            st.success("No failing whole-network KPIs for this date.")
 
 # ============================================================
 # 📡 KPIs & PERFORMANCE — Scorecards, Worst Cells, Traffic & Capacity,
@@ -772,6 +801,41 @@ elif section == "🔎 Investigate":
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 width='stretch',
                             )
+
+# ============================================================
+# 📋 HQ REPORTS — recurring HQ/Tripoli report templates (e.g. NQ Data
+# Collection Template), built straight from output/csv/ instead of the
+# old manual per-sheet scripts. One sub-tab per report, more added over
+# time as they come up.
+# ============================================================
+elif section == "📋 HQ Reports":
+    sec_tabs = st.tabs(["📄 NQ Data Collection Template"])
+
+    with sec_tabs[0]:
+        st.caption("EAST branch only, built from output/csv/ history. Not included yet: "
+                   "Network Daily KPI's (a few columns still need source confirmation). "
+                   "External Interference's 2G row will read 0 until 2G_Cell_Hourly.csv has "
+                   "more than 5 days of history - the >5-bad-days rule can't fire yet, not a bug.")
+
+        nq_sheets = cached_nq_template()
+
+        sheet_tabs = st.tabs(list(nq_sheets.keys()))
+        for sheet_tab, (sheet_name, df) in zip(sheet_tabs, nq_sheets.items()):
+            with sheet_tab:
+                if df is not None and not df.empty:
+                    st.dataframe(df, width='stretch', hide_index=True)
+                    st.caption(f"{len(df)} row(s)")
+                else:
+                    st.info("No data available for this sheet yet.")
+
+        st.divider()
+        st.download_button(
+            "⬇️ Download NQ Data Collection Template (.xlsx)",
+            data=cached_nq_template_bytes(),
+            file_name=f"NQ_Data_Collection_Template_{target_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.caption("Download only for now — upload to SharePoint manually until auto-upload is set up.")
 
 # ============================================================
 # 📧 REPORTS — network summary + copy-paste text + Word/Excel export

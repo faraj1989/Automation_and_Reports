@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+Libyana NPM - Special (HQ) Reports Processor
+Builds the recurring HQ/Tripoli report sheets (starting with the "NQ Data
+Collection Template") directly from the pipeline's own output/csv/ history,
+instead of the old manual per-sheet scripts (raw SFTP zip -> pandas by
+hand). Each build_* function returns one sheet's DataFrame, EAST branch
+only, matching the template's column names as closely as the template
+itself allows.
+"""
+
+import os
+import re
+import json
+import logging
+import functools
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+BRANCH = 'East'
+
+CITY_MAP_FILE = 'config/site_arabic_city_map.json'
+CELL_INFO_FILE = 'config/LIBYANA Cell Info.xlsx'
+
+_SITE_RE = re.compile(r'^(L[A-Z]+\d+)(-\d+)?$')
+
+
+def _site_of(cell_name: str):
+    m = _SITE_RE.match(str(cell_name).strip())
+    return m.group(1) if m else None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_city_map():
+    """Site -> Arabic city name, built from historical "Cells with High DL
+    PRB (EAST)" rows in the NQ template (ground truth) plus a reliable
+    (>=90%-consistent) letter-prefix fallback - see
+    config/site_arabic_city_map.json and the chat history for how this was
+    derived (coordinate-based fallback for the handful of sites with
+    neither, verified against Libya's real bounding box to reject bad
+    source coordinates)."""
+    if not os.path.exists(CITY_MAP_FILE):
+        return {}, {}
+    with open(CITY_MAP_FILE, encoding='utf-8') as f:
+        d = json.load(f)
+    return d.get('site_city', {}), d.get('prefix_city', {})
+
+
+def _city_for_site(site: str) -> str:
+    site_city, prefix_city = _load_city_map()
+    if site in site_city:
+        return site_city[site]
+    m = re.match(r'^(L[A-Z]+)', site)
+    if m and m.group(1) in prefix_city:
+        return prefix_city[m.group(1)]
+    return ''
+
+
+@functools.lru_cache(maxsize=1)
+def _load_cell_coords():
+    """Cell Name -> (lat, lon) from config/LIBYANA Cell Info.xlsx (East
+    sheet), plus a per-site average for cells not found individually."""
+    if not os.path.exists(CELL_INFO_FILE):
+        return {}, {}
+    import openpyxl
+    wb = openpyxl.load_workbook(CELL_INFO_FILE, data_only=True, read_only=True)
+    ws = wb['East']
+    cell_coords = {}
+    site_points = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        cell_name, lat, lon = row[1], row[10], row[11]
+        if not cell_name or lat is None or lon is None:
+            continue
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        cell_coords[str(cell_name).strip()] = (lat, lon)
+        site = _site_of(cell_name) or _site_of('L' + str(cell_name).strip())
+        if site:
+            site_points.setdefault(site, []).append((lat, lon))
+    site_coords = {s: (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+                   for s, pts in site_points.items()}
+    return cell_coords, site_coords
+
+
+def _coords_for_cell(cell_name: str, site: str):
+    cell_coords, site_coords = _load_cell_coords()
+    if cell_name in cell_coords:
+        return cell_coords[cell_name]
+    if site in site_coords:
+        return site_coords[site]
+    return (None, None)
+
+# Template's 4 DL PRB utilization buckets, in low-to-high order (used for
+# the tie-break: equal day-counts in two buckets -> higher bucket wins,
+# matching the original script's TIE_BREAKER='higher' default). Lower
+# bound of the first bucket is exclusive (0% itself is treated as
+# invalid/"Other" and dropped, not "no load"), matching the original
+# script's `if 0 < prb_value < 70`.
+PRB_BUCKETS = [
+    (0, False, 70, 'DL PRB  UT 0%<X<70%'),
+    (70, True, 80, 'DL PRB  UT 70%<X<80%'),
+    (80, True, 90, 'DL PRB  UT 80%<X<90%'),
+    (90, True, 100.0001, 'DL PRB  UT 90%<X<100%'),
+]
+
+
+def _load_csv(csv_folder, name):
+    path = os.path.join(csv_folder, f"{name}.csv")
+    if not os.path.exists(path):
+        logger.warning(f"Special report source not found: {path}")
+        return None
+    df = pd.read_csv(path)
+    return df if not df.empty else None
+
+
+def build_subscribers_report(csv_folder='output/csv') -> pd.DataFrame:
+    """Subscribers sheet: one row per ISO week (Wednesday's daily figure -
+    output/csv/User_Summary.csv is already one row/day, so "peak of the
+    week" simplifies to "that week's Wednesday reading", matching the
+    original per-hour-peak script's weekday==3 filter without needing to
+    hunt through hourly data that no longer exists at this grain)."""
+    df = _load_csv(csv_folder, 'User_Summary')
+    if df is None:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+    df = df[df['Date'].dt.weekday == 2]  # Wednesday
+
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in df.iterrows():
+        iu = r.get('Roaming 3G PS (Iu)')
+        s1 = r.get('Roaming 4G PS (S1)')
+        rows.append({
+            'year': r['Date'].year,
+            'Week no': f"W{int(r['Date'].isocalendar().week):02d}",
+            'Branch': BRANCH,
+            'Maximum number of attached subscribers(GSM In SGSN)': r.get('2G PS user'),
+            'Maximum number of attached subscribers(UMTS in SGSN )': r.get('3G PS user'),
+            'Number of subscribers in VLR (Connected to BSC)': r.get('2G CS user'),
+            'Number of subscribers in VLR (Connected to RNC)': r.get('3G CS user'),
+            'Max Number of EPS Attach subscribers in MME': r.get('4G PS user'),
+            'Number of Registered Subscribers (Almadar in Libyana Metwork)': r.get('Roaming CS (Almadar)'),
+            'Number of Registered Subscribers (Almadar in Libyana PS Network) for(3G,4G)':
+                f"3G={iu},4G={s1}" if pd.notna(iu) and pd.notna(s1) else '',
+        })
+
+    return pd.DataFrame(rows).sort_values(['year', 'Week no']).reset_index(drop=True)
+
+
+def build_prb_bucket_report(csv_folder='output/csv', min_days_per_cell_month=10) -> pd.DataFrame:
+    """4G Cell Prb Dl ut(%) sheet: majority DL-PRB-utilization bucket per
+    cell per month, EAST only, from output/csv/4G_Cell_BH.csv (already
+    busy-hour, one value per cell per day - the original script's own
+    "already matches the criteria" note). Criteria: Availability >99% (or
+    missing - kept per the original script's NIL-handling), >=10 valid
+    days in the month, majority bucket wins ties toward the higher bucket."""
+    df = _load_csv(csv_folder, '4G_Cell_BH')
+    if df is None or 'Cell Name' not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month
+    df['Month_Name'] = df['Date'].dt.strftime('%B')
+
+    avail = pd.to_numeric(df['Radio Network Availability Rate(%)'], errors='coerce')
+    prb = pd.to_numeric(df['DL PRB Utilizing Rate(%)'], errors='coerce')
+
+    df = df[(avail.isna()) | (avail > 99)]
+    df = df.assign(_prb=prb.loc[df.index]).dropna(subset=['_prb'])
+
+    if df.empty:
+        return pd.DataFrame()
+
+    day_counts = df.groupby(['Cell Name', 'Year', 'Month']).size().reset_index(name='Days')
+    valid_cells = day_counts[day_counts['Days'] >= min_days_per_cell_month][['Cell Name', 'Year', 'Month']]
+    df = df.merge(valid_cells, on=['Cell Name', 'Year', 'Month'], how='inner')
+
+    if df.empty:
+        return pd.DataFrame()
+
+    def bucket_of(v):
+        for lo, lo_inclusive, hi, label in PRB_BUCKETS:
+            if (v >= lo if lo_inclusive else v > lo) and v < hi:
+                return label
+        return None
+
+    df['Bucket'] = df['_prb'].apply(bucket_of)
+    df = df.dropna(subset=['Bucket'])
+
+    bucket_order = {label: i for i, (_, _, _, label) in enumerate(PRB_BUCKETS)}
+    counts = df.groupby(['Cell Name', 'Year', 'Month', 'Bucket']).size().reset_index(name='Day_Count')
+    counts['Bucket_Order'] = counts['Bucket'].map(bucket_order)
+    counts = counts.sort_values(
+        ['Cell Name', 'Year', 'Month', 'Day_Count', 'Bucket_Order'],
+        ascending=[True, True, True, False, False],
+    )
+    majority = counts.groupby(['Cell Name', 'Year', 'Month']).first().reset_index()
+
+    monthly_counts = majority.groupby(['Year', 'Month', 'Bucket']).size().reset_index(name='Count')
+    month_names = df[['Year', 'Month', 'Month_Name']].drop_duplicates()
+    monthly_counts = monthly_counts.merge(month_names, on=['Year', 'Month'], how='left')
+
+    rows = []
+    for (year, month), grp in monthly_counts.groupby(['Year', 'Month']):
+        month_name = grp['Month_Name'].iloc[0]
+        counts_by_bucket = dict(zip(grp['Bucket'], grp['Count']))
+        total = 0
+        for _, _, _, label in PRB_BUCKETS:
+            c = counts_by_bucket.get(label, 0)
+            rows.append({'year': year, 'Month': month_name, 'Branch': label, BRANCH: c})
+            total += c
+        rows.append({'year': year, 'Month': month_name, 'Branch': 'Total', BRANCH: total})
+
+    return pd.DataFrame(rows)
+
+
+def build_high_prb_cells_report(csv_folder='output/csv', min_days_per_cell_week=4) -> pd.DataFrame:
+    """Cells with High DL PRB (EAST) sheet: weekly (Sun-Sat, matching the
+    template's existing date-range format) listing of individual cells
+    whose majority DL-PRB bucket that week is 90-100%, with coordinates
+    and Arabic city name. Same availability/PRB filter as
+    build_prb_bucket_report(), just grouped by week instead of month, and
+    listing cells instead of counting them.
+
+    `min_days_per_cell_week` (default 4 of a possible 7) is a judgment
+    call, not from your original script (which only defined a monthly
+    threshold) - adjust if you want a different bar."""
+    df = _load_csv(csv_folder, '4G_Cell_BH')
+    if df is None or 'Cell Name' not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+
+    avail = pd.to_numeric(df['Radio Network Availability Rate(%)'], errors='coerce')
+    prb = pd.to_numeric(df['DL PRB Utilizing Rate(%)'], errors='coerce')
+    df = df[(avail.isna()) | (avail > 99)]
+    df = df.assign(_prb=prb.loc[df.index]).dropna(subset=['_prb'])
+    if df.empty:
+        return pd.DataFrame()
+
+    # Sunday-Saturday week window, matching the template's existing
+    # "17-08-2025 to 23-08-2025" date-range format.
+    week_start = df['Date'] - pd.to_timedelta((df['Date'].dt.weekday + 1) % 7, unit='D')
+    df['_week_start'] = week_start
+
+    def bucket_of(v):
+        for lo, lo_inclusive, hi, label in PRB_BUCKETS:
+            if (v >= lo if lo_inclusive else v > lo) and v < hi:
+                return label
+        return None
+
+    df['Bucket'] = df['_prb'].apply(bucket_of)
+    df = df.dropna(subset=['Bucket'])
+
+    day_counts = df.groupby(['Cell Name', '_week_start']).size().reset_index(name='Days')
+    valid_cells = day_counts[day_counts['Days'] >= min_days_per_cell_week][['Cell Name', '_week_start']]
+    df_valid = df.merge(valid_cells, on=['Cell Name', '_week_start'], how='inner')
+    if df_valid.empty:
+        return pd.DataFrame()
+
+    bucket_order = {label: i for i, (_, _, _, label) in enumerate(PRB_BUCKETS)}
+    counts = df_valid.groupby(['Cell Name', '_week_start', 'Bucket']).size().reset_index(name='Day_Count')
+    counts['Bucket_Order'] = counts['Bucket'].map(bucket_order)
+    counts = counts.sort_values(
+        ['Cell Name', '_week_start', 'Day_Count', 'Bucket_Order'],
+        ascending=[True, True, False, False],
+    )
+    majority = counts.groupby(['Cell Name', '_week_start']).first().reset_index()
+    high_prb = majority[majority['Bucket'] == PRB_BUCKETS[-1][3]]
+    if high_prb.empty:
+        return pd.DataFrame()
+
+    # Weekly average PRB (all valid days that week, not just the
+    # majority-bucket days) for the cells that made the cut.
+    week_avg = df_valid.groupby(['Cell Name', '_week_start'])['_prb'].mean().reset_index(name='avg_prb')
+    high_prb = high_prb.merge(week_avg, on=['Cell Name', '_week_start'], how='left')
+
+    rows = []
+    for _, r in high_prb.iterrows():
+        cell_name = r['Cell Name']
+        site = _site_of(cell_name)
+        lat, lon = _coords_for_cell(cell_name, site)
+        week_end = r['_week_start'] + pd.Timedelta(days=6)
+        rows.append({
+            'Date': f"{r['_week_start'].strftime('%d-%m-%Y')} to {week_end.strftime('%d-%m-%Y')}",
+            'Cell Name': cell_name,
+            'Area': BRANCH,
+            'DL PRB (%)': r['avg_prb'],
+            'Long': lon,
+            'Lat': lat,
+            'City': _city_for_site(site) if site else '',
+        })
+
+    return pd.DataFrame(rows).sort_values(['Date', 'Cell Name']).reset_index(drop=True)
+
+
+def build_cell_data_report(csv_folder='output/csv', throughput_threshold=3, prb_threshold=70) -> pd.DataFrame:
+    """Cell Data sheet: daily count of EAST 4G cells above the DL
+    throughput / PRB utilization thresholds, plus total cell count, from
+    output/csv/4G_Cell_BH.csv."""
+    df = _load_csv(csv_folder, '4G_Cell_BH')
+    if df is None or 'Cell Name' not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    throughput = pd.to_numeric(df['User Downlink Average Throughput (Mbps)'], errors='coerce')
+    prb = pd.to_numeric(df['DL PRB Utilizing Rate(%)'], errors='coerce')
+
+    rows = []
+    for date, grp in df.groupby('Date'):
+        idx = grp.index
+        high_throughput_cells = grp.loc[throughput.loc[idx] > throughput_threshold, 'Cell Name'].nunique()
+        high_prb_cells = grp.loc[prb.loc[idx] > prb_threshold, 'Cell Name'].nunique()
+        total_cells = grp['Cell Name'].nunique()
+        rows.append({
+            'Day': date,
+            'Region': BRANCH,
+            f'Number Of Cells with Average DL Throughput per User >{throughput_threshold}Mbps @cell BH': high_throughput_cells,
+            f'Number Of Cells with L PRB Utilization Rate(%t)>{prb_threshold}% @cell BH': high_prb_cells,
+            'Total Number of cells': total_cells,
+        })
+
+    return pd.DataFrame(rows).sort_values('Day').reset_index(drop=True)
+
+
+# 3G DL frequency -> band (matches the original script's map_dl_freq)
+_3G_BAND_MAP = {3054: 900, 3062: 900, 3075: 900, 10562: 2100, 10587: 2100}
+# 4G "Frequency band" (a band INDEX, not the raw EARFCN channel number) -> MHz
+_4G_BAND_MAP = {1: 2100, 3: 1800, 8: 900, 28: 700}
+
+
+def _interference_month_cols(dates: pd.Series):
+    year = dates.dt.year
+    month_name = dates.dt.strftime('%B')
+    return year, month_name
+
+
+def build_external_interference_report(csv_folder='output/csv',
+                                        gsm_daily_threshold=5, gsm_min_bad_days=5,
+                                        umts_lte_hourly_threshold_hours=6) -> pd.DataFrame:
+    """External Interference sheet, EAST only, one section per technology:
+
+    - 2G: from 2G_Cell_Hourly.csv. Band from 'DL frequency' (already
+      GSM900/DCS1800 text). A cell/day counts as "bad" if that day's mean
+      Interference Band Proportion (4~5)(%) > 5 (your script's daily
+      threshold); a cell counts toward the month's total if it had MORE
+      THAN 5 such bad days that month (your template's criteria note -
+      the pasted script itself didn't implement this day-count, only the
+      note did, so this reconciles the two).
+    - 3G: from 3G_Cell_Hourly.csv. VS.MeanRTWP > -95dBm counts as an
+      "interfered hour"; a cell counts if ANY single day had >=6 such
+      hours (exactly your process_3g_interference rule). Band from 'DL
+      frequency' via the same frequency->band table your script used.
+    - 4G: from 4G_Cell_Hourly.csv. L.UL.Interference.Avg(dBm) > -100dBm
+      counts as an "interfered hour", same >=6-hours-in-a-day rule. Band
+      from 'Frequency band' (a band index, not the raw EARFCN channel
+      number 'Downlink EARFCN' - your script's {1,3,8,28} mapping matches
+      this column, not EARFCN itself)."""
+    rows = []
+
+    # ---- 2G ----
+    df2 = _load_csv(csv_folder, '2G_Cell_Hourly')
+    if df2 is not None and 'DL frequency' in df2.columns:
+        df2 = df2.copy()
+        df2['Date'] = pd.to_datetime(df2['Time'], errors='coerce').dt.floor('D')
+        df2 = df2.dropna(subset=['Date'])
+        df2['_interf'] = pd.to_numeric(df2['Interference Band Proportion (4~5)(%)'], errors='coerce')
+
+        daily = df2.groupby(['Cell Name', 'DL frequency', 'Date'])['_interf'].mean().reset_index()
+        year, month_name = _interference_month_cols(daily['Date'])
+        daily['Year'], daily['Month'] = year, month_name
+
+        total_per_band = daily.groupby(['Year', 'Month', 'DL frequency'])['Cell Name'].nunique()
+
+        bad_days = daily[daily['_interf'] > gsm_daily_threshold]
+        bad_day_counts = bad_days.groupby(['Cell Name', 'DL frequency', 'Year', 'Month']).size().reset_index(name='BadDays')
+        interfered = bad_day_counts[bad_day_counts['BadDays'] > gsm_min_bad_days]
+        interfered_per_band = interfered.groupby(['Year', 'Month', 'DL frequency'])['Cell Name'].nunique()
+
+        for (year, month, band), total in total_per_band.items():
+            count = interfered_per_band.get((year, month, band), 0)
+            rows.append({'year': year, 'week': month, 'Tech Type': '2G', 'Branch': BRANCH,
+                         'Band': band, 'Count of Cells with External interference': count,
+                         'Total count of cells': total})
+
+    # ---- 3G / 4G (shared shape: hourly threshold -> interfered-hours/day -> any day >= N hours) ----
+    for tech, sheet, metric_col, threshold, band_col, band_map in [
+        ('3G', '3G_Cell_Hourly', 'VS.MeanRTWP', -95, 'DL frequency', _3G_BAND_MAP),
+        ('4G', '4G_Cell_Hourly', 'L.UL.Interference.Avg(dBm)', -100, 'Frequency band', _4G_BAND_MAP),
+    ]:
+        df = _load_csv(csv_folder, sheet)
+        if df is None or band_col not in df.columns or metric_col not in df.columns:
+            continue
+        df = df.copy()
+        df['Date'] = pd.to_datetime(df['Time'], errors='coerce').dt.floor('D')
+        df = df.dropna(subset=['Date'])
+        df['_metric'] = pd.to_numeric(df[metric_col], errors='coerce')
+        df['Band'] = pd.to_numeric(df[band_col], errors='coerce').map(band_map)
+        df = df.dropna(subset=['Band'])
+        df['_is_interfered_hour'] = df['_metric'] > threshold
+
+        year, month_name = _interference_month_cols(df['Date'])
+        df['Year'], df['Month'] = year, month_name
+
+        total_per_band = df.groupby(['Year', 'Month', 'Band'])['Cell Name'].nunique()
+
+        daily_hours = df.groupby(['Cell Name', 'Band', 'Year', 'Month', 'Date'])['_is_interfered_hour'].sum().reset_index(name='Hours')
+        bad_cell_days = daily_hours[daily_hours['Hours'] >= umts_lte_hourly_threshold_hours]
+        interfered_cells = bad_cell_days[['Cell Name', 'Band', 'Year', 'Month']].drop_duplicates()
+        interfered_per_band = interfered_cells.groupby(['Year', 'Month', 'Band'])['Cell Name'].nunique()
+
+        for (year, month, band), total in total_per_band.items():
+            count = interfered_per_band.get((year, month, band), 0)
+            rows.append({'year': year, 'week': month, 'Tech Type': tech, 'Branch': BRANCH,
+                         'Band': int(band), 'Count of Cells with External interference': count,
+                         'Total count of cells': total})
+
+    return pd.DataFrame(rows).sort_values(['year', 'week', 'Tech Type', 'Band']).reset_index(drop=True)
+
+
+def build_nq_template_report(csv_folder='output/csv') -> dict:
+    """All currently-ready NQ Data Collection Template sheets, EAST only.
+    Network Daily KPI's still needs column-by-column source confirmation
+    for a few columns (Gi Interface is settled; E-RAB/RRC Drop Rate, Max
+    RRC Connection User, and Packet Loss Rate meaning are still open) and
+    isn't included yet."""
+    return {
+        'Subscribers': build_subscribers_report(csv_folder),
+        '4G Cell Prb Dl ut(%)': build_prb_bucket_report(csv_folder),
+        'Cell Data': build_cell_data_report(csv_folder),
+        'Cells with High DL PRB (EAST)': build_high_prb_cells_report(csv_folder),
+        'External Interference': build_external_interference_report(csv_folder),
+    }

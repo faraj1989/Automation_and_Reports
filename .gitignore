@@ -12,6 +12,9 @@ __pycache__/
 .venv/
 venv/
 
+# Claude Code local session/tool settings - machine-specific, not project source
+.claude/
+
 # Credentials - never commit
 ftp_config.json
 ftp_config.jason

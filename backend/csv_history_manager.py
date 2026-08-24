@@ -340,6 +340,57 @@ class CSVHistoryManager:
         logger.info(f"Cell KPIs: {total_new} new rows, {total_skipped} skipped")
         return total_new, total_skipped
 
+    def update_transmission_kpis(self, results_dict):
+        """Update all Transmission KPI CSVs (already aggregated to one row
+        per link per day by transmission_kpi_processor.py)."""
+        if not results_dict:
+            return
+
+        total_new = 0
+        total_skipped = 0
+
+        for sheet_name, df in results_dict.items():
+            if df is not None and not df.empty:
+                key_cols = ['Date', 'Adjacent Node ID']
+                new_count, skipped_count = self._append_with_dup_check(sheet_name, df, key_cols)
+                total_new += new_count
+                total_skipped += skipped_count
+                logger.info(f"Transmission KPI {sheet_name}: {new_count} new rows, {skipped_count} skipped")
+
+        logger.info(f"Transmission KPIs: {total_new} new rows, {total_skipped} skipped")
+        return total_new, total_skipped
+
+    def update_hourly_cell_kpis(self, results_dict, retention_days=14):
+        """Update the hourly all-cells CSVs (2G_Cell_Hourly/3G_Cell_Hourly/
+        4G_Cell_Hourly). Each fetch re-sends a rolling window of mostly the
+        same hours already archived, at millions of rows total, so this
+        uses a vectorized concat + drop_duplicates instead of
+        _append_with_dup_check's per-row loop (which doesn't scale here).
+        Keeps only the most recent `retention_days` of hourly detail -
+        long-term trends live on the daily busy-hour sheets instead."""
+        if not results_dict:
+            return
+
+        key_cols = ['Time', 'Cell Name']
+
+        for sheet_name, df in results_dict.items():
+            if df is None or df.empty:
+                continue
+
+            existing = self._read_csv(sheet_name)
+            rows_before = len(existing)
+
+            combined = pd.concat([existing, df], ignore_index=True) if not existing.empty else df.copy()
+            combined = combined.drop_duplicates(subset=key_cols, keep='last')
+
+            times = pd.to_datetime(combined['Time'], errors='coerce')
+            cutoff = times.max() - pd.Timedelta(days=retention_days)
+            combined = combined[times >= cutoff]
+
+            self._write_csv(sheet_name, combined)
+            logger.info(f"Hourly Cell KPI {sheet_name}: {rows_before} -> {len(combined)} rows "
+                        f"(retention {retention_days}d)")
+
     def update_traffic_kpis(self, results_dict):
         """Update all traffic KPI CSVs."""
         if not results_dict:

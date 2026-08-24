@@ -52,6 +52,11 @@ NETWORK_KPI_FILES = {
         'patterns': ['* (4G-NW_Daily).csv', '*(4G-NW_Daily).csv', '*4G-NW_Daily*.csv'],
         'sheet_name': '4G_NW_Daily',
         'key_columns': ['Date', 'Whole Network']
+    },
+    'Gi_Interface_Traffic': {
+        'patterns': ['*Gi Interface Traffic*.csv', '*Gi_Interface_Traffic*.csv'],
+        'sheet_name': 'Gi_Interface_Traffic',
+        'key_columns': ['Date', 'Whole Network']
     }
 }
 

@@ -90,11 +90,13 @@ TRAFFIC_SPECS = [
 # traffic/user volumes) tracked in the trend section alongside every
 # threshold-checked busy-hour KPI for that technology. Label -> Column_Name
 # in the technology's NWBH sheet.
-# UMTS 'Availability' is deliberately excluded here too - see the note on
-# AVAILABILITY_PROXY below (raw values are bogus large negatives).
+# Availability is intentionally NOT listed per-tech here - all three
+# technologies now have a proper threshold-checked Availability KPI in
+# kpi_thresholds.csv (Dimension=Resource Utilization), so build_trend()
+# already pulls it in as a threshold KPI. See AVAILABILITY_PROXY below for
+# the raw-column caveat on UMTS.
 EXTRA_TREND_KPIS = {
     'GSM': [
-        ('TCH Availability (%)', 'RR307:TCH Availability(%)'),
         ('TCH Traffic (Erl)', 'K3014:Traffic Volume on TCH(Erl)'),
         ('SDCCH Traffic (Erl)', 'K3004:Traffic Volume on SDCCH(Erl)'),
         ('PS Traffic (MB)', 'PS Traffic (RLC)(MB)'),
@@ -105,7 +107,6 @@ EXTRA_TREND_KPIS = {
         ('HSDPA Throughput/user (Kbps)', 'HSDPA Throughput per user (Local Cell)(Kbps)'),
     ],
     'LTE': [
-        ('Radio Network Availability (%)', 'Radio Network Availability Rate(%)'),
         ('DL Traffic Volume (GB)', 'Downlink Traffic Volume(GB)'),
         ('UL Traffic Volume (GB)', 'Uplink Traffic Volume (GB)'),
         ('User DL Avg Throughput (Mbps)', 'User Downlink Average Throughput (Mbps)'),
@@ -118,14 +119,15 @@ EXTRA_TREND_KPIS = {
 
 # Availability proxy per technology (no true site-level up/down feed yet,
 # so busy-hour network availability is used as a stand-in).
-# NOTE: 3G_NWBH's "Availability" column is excluded here — its raw values are
-# large negative numbers on every single day in the source data (e.g. -12,366
-# on 2026-08-16), so it is not actually a 0-100% availability figure. This
-# looks like a mapping/computation bug in network_kpi_processor.py's 3G KPI
-# extraction and needs investigating at the source before it can be trusted.
+# NOTE: 3G_NWBH's raw "Availability" column is still garbage (large negative
+# numbers, e.g. -61,428 on 2026-08-22) and stays excluded everywhere - it was
+# a mapping/computation bug at the source. It has since been superseded by a
+# new corrected column, "Availability_all level" (populated from 2026-08-19
+# onward), which is what both this proxy and the UMTS Availability KPI in
+# kpi_thresholds.csv use instead.
 AVAILABILITY_PROXY = {
     'GSM': ('2G_NWBH', 'RR307:TCH Availability(%)'),
-    'UMTS': None,
+    'UMTS': ('3G_NWBH', 'Availability_all level'),
     'LTE': ('4G_NWBH', 'Radio Network Availability Rate(%)'),
 }
 
@@ -165,6 +167,7 @@ SITE_OVERLAP_COLS = [
 ]
 
 SUGGESTION_RULES = [
+    ('Availability', 'Check site/cell outage alarms, transmission link, power, or hardware faults'),
     ('Drop', 'Investigate interference / hardware / neighbor list'),
     ('HO', 'Review handover / neighbor parameters'),
     ('Handover', 'Review handover / neighbor parameters'),
@@ -293,6 +296,7 @@ class ReportGenerator:
                 'Weight': r['Weight'],
                 'Dimension': r['Dimension'],
                 'Delta vs Yesterday': delta,
+                'Possible Cause': '' if passed else self._suggest_action(r['KPI_Name']),
             })
 
         return pd.DataFrame(rows)
@@ -337,6 +341,7 @@ class ReportGenerator:
                         'tech': tech,
                         'value': row["Today's Value"],
                         'threshold': row['Threshold'],
+                        'possible_cause': row.get('Possible Cause') or self._suggest_action(row['KPI Name']),
                         'severity': 'Critical',
                     })
 
