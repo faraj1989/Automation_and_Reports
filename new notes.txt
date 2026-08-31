@@ -1,30 +1,3 @@
-good now  for Network Summary site details - 2026-08-09  if the selected date not available brign last available one no need to update it each time, for 4G Network KPIs i wna to include the ,
 
-FOR User KPIs 	ARRNAGE THEM LIKE 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-📶 4G Network KPIs CAHNGE IT FOR 4G Network KPIs At Busy Hour :  and add buttom that will open another page that shows deatail below kpi from table  4G_NWBH i wan tto show it in detilas in table in the new page will show last day existing or yesterday state fpor all kpi in the sheet  4G_NWBH:
-
-RRC Setup Success Rate(%)	E-RAB Setup Success Rate	Intra-HO  execute Success Rate	Service Drop Rate (All)	Downlink Packet Loss	Uplink Packet Loss Rate	User Downlink Average Throughput (Mbps)	User Uplink Average Throughput (Mbps)	DL PRB Utilizing Rate(%)	UL PRB Utilizing Rate(%)	CSFB Preparation Success Rate	L.UL.Interference.Avg(dBm)	Radio Network Availability Rate(%)	L.Cell.Unavail.Dur.Sys(s)	L.Cell.Unavail.Dur.Manual(s)	L.Traffic.User.Avg	L.Traffic.User.Max	Downlink Traffic Volume(GB)	Uplink Traffic Volume (GB)	Inter-Freq Handover Success Rate (%)(%)	S1-Signal Connection Establishment Success Rate (%)(%)	VoLTE Traffic Volume (Erl)	VoLTE Setup Success Rate-ZM(%)
-
-also i want to add line charts for each kpi that draw line chart for eaxch kpi in that 4g network busy hour kpis, 
-
-alos use kpi from 4G_NW_Daily this is daily kpi  UL Traffic  Volume(GB)	DL Traffic  Volume(GB)	L.Traffic.User.Max	VoLTE Traffic Volume (Erl)	
-
-also above chart i want it to be drawn by taking the last available 14 days in corresponding sheet,
-
-== i want to do the same for 3G 3G_NWBH , 3G_NW_Daily and i want to do the same for 2G 2G_NWBH , 2G_NW_Daily  so in the main page dash board will be an button or link to goto table showing last day or yesterday kpis for 2,3,4G and below the table or tables are listed the line chart for last avialble 14 days for each 2,3,4 kpis as menthioned above
-  
-=============================
+what about Gi Interface Traffic  and Transmission KPIs (IUB/ABIS) the kpis already in ftp server and already downolaed at today 6:30 am  can you check them  
+can you review and confirm they while we wating for the 1200 hours cells file to be downloaded 

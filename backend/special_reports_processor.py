@@ -428,7 +428,11 @@ def build_external_interference_report(csv_folder='output/csv',
                          'Band': int(band), 'Count of Cells with External interference': count,
                          'Total count of cells': total})
 
-    return pd.DataFrame(rows).sort_values(['year', 'week', 'Tech Type', 'Band']).reset_index(drop=True)
+    result = pd.DataFrame(rows).sort_values(['year', 'week', 'Tech Type', 'Band']).reset_index(drop=True)
+    # 2G's Band is text ('GSM900'/'DCS1800') while 3G/4G's is an int MHz value (900/1800/2100/700) -
+    # mixing both in one object column is what Streamlit's Arrow conversion above was choking on.
+    result['Band'] = result['Band'].astype(str)
+    return result
 
 
 def build_nq_template_report(csv_folder='output/csv') -> dict:

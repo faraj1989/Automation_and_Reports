@@ -12,6 +12,7 @@ comes from config/kpi_thresholds.csv via HealthChecker, same as the report.
 
 import os
 import sys
+from typing import Dict, List
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,7 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from backend.report_generator import (
-    ReportGenerator, TECH_LABELS, CELL_SHEETS, SCORECARD_SHEETS, SITE_COL_BY_TECH,
+    ReportGenerator, TECH_LABELS, CELL_SHEETS, SCORECARD_SHEETS, SITE_COL_BY_TECH, autofit_excel_columns,
 )
 from backend import ept_manager as ept
 from backend.special_reports_processor import build_nq_template_report
@@ -108,6 +109,38 @@ def cached_cell_thresholds(tech, sheet):
 
 
 @st.cache_data(ttl=600)
+def cached_cell_dimensions(tech, sheet):
+    return rg.get_trend_kpi_dimensions(tech, sheet=sheet)
+
+
+DIMENSION_ORDER = ["Accessibility", "Retainability", "Mobility", "Resource Utilization", "Quality"]
+
+
+def render_grouped_cell_trend_charts(cell_trend_df, kpi_cols, kpi_thresholds, kpi_dimensions, key_prefix):
+    """Render one multi-cell trend chart per KPI, grouped into collapsible
+    per-Dimension sections (fixed order, 'Other' catch-all last) instead of
+    one flat grid - keeps a large KPI set (golden + supplementary) scannable.
+    First non-empty group starts expanded, the rest collapsed."""
+    grouped: Dict[str, List[str]] = {}
+    for kpi in kpi_cols:
+        dim = kpi_dimensions.get(kpi, "Other")
+        grouped.setdefault(dim, []).append(kpi)
+
+    ordered_dims = [d for d in DIMENSION_ORDER if d in grouped] + \
+        [d for d in grouped if d not in DIMENSION_ORDER]
+
+    for i, dim in enumerate(ordered_dims):
+        dim_kpis = grouped[dim]
+        with st.expander(f"{dim} ({len(dim_kpis)})", expanded=(i == 0)):
+            cols = st.columns(2)
+            for j, kpi in enumerate(dim_kpis):
+                with cols[j % 2]:
+                    render_multi_cell_trend_chart(
+                        cell_trend_df, kpi, kpi_thresholds.get(kpi), key=f"{key_prefix}_{kpi}",
+                    )
+
+
+@st.cache_data(ttl=600)
 def cached_word_bytes(target_date, previous_date):
     b = cached_bundle(target_date, previous_date)
     path = rg.generate_word_report(
@@ -144,6 +177,7 @@ def cached_nq_template_bytes():
         for sheet_name, df in sheets.items():
             if df is not None and not df.empty:
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+        autofit_excel_columns(writer)
     return buf.getvalue()
 
 
@@ -282,7 +316,7 @@ def render_word_export_button(title, tables, key_prefix, subtitle=""):
 st.markdown("""
 <div class="header-container">
     <h1 style="margin:0;">📊 Libyana Network Performance Dashboard</h1>
-    <p style="margin:0;">EAST Region | 2G / 3G / 4G — live from the daily KPI pipeline</p>
+    <p style="margin:0;">2G / 3G / 4G — live from the daily KPI pipeline</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -348,7 +382,7 @@ if section == "📊 Overview":
 
         st.subheader("Multi-RAT Site Composition")
         st.dataframe(bundle['site_inventory'], width='stretch', hide_index=True)
-        st.caption(f"As of {target_date} | Region: EAST")
+        st.caption(f"As of {target_date}")
 
     with sec_tabs[1]:
         icon, status = score_icon(health.get('overall_score', 0))
@@ -674,15 +708,14 @@ elif section == "🔎 Investigate":
                         st.info("No historical data available for the selected cell(s).")
                     else:
                         kpi_thresholds = cached_cell_thresholds(explore_tech, sheet_name)
+                        kpi_dimensions = cached_cell_dimensions(explore_tech, sheet_name)
                         kpi_cols = [c for c in cell_trend.columns if c not in ('Date', 'Cell')]
-                        st.caption("Dashed line = threshold. One line per selected cell; hover to compare.")
-                        cols = st.columns(2)
-                        for i, kpi in enumerate(kpi_cols):
-                            with cols[i % 2]:
-                                render_multi_cell_trend_chart(
-                                    cell_trend, kpi, kpi_thresholds.get(kpi),
-                                    key=f"cell_trend_{explore_tech}_{kpi}",
-                                )
+                        st.caption("Dashed line = threshold. One line per selected cell; hover to compare. "
+                                   "Grouped by KPI dimension - click a section to expand.")
+                        render_grouped_cell_trend_charts(
+                            cell_trend, kpi_cols, kpi_thresholds, kpi_dimensions,
+                            key_prefix=f"cell_trend_{explore_tech}",
+                        )
 
                         st.divider()
                         if st.button("📄 Export Selection as Word", key="ce_word_btn"):
@@ -774,13 +807,12 @@ elif section == "🔎 Investigate":
 
                         st.subheader(f"📈 Trend ({sr_start} to {sr_end})")
                         sr_kpi_thresholds = rg.get_trend_kpi_thresholds(sr_tech, sheet=sr_sheet)
+                        sr_kpi_dimensions = rg.get_trend_kpi_dimensions(sr_tech, sheet=sr_sheet)
                         sr_kpi_cols = [c for c in sr_trend.columns if c not in ('Date', 'Cell')]
-                        sr_cols = st.columns(2)
-                        for i, kpi in enumerate(sr_kpi_cols):
-                            with sr_cols[i % 2]:
-                                render_multi_cell_trend_chart(
-                                    sr_trend, kpi, sr_kpi_thresholds.get(kpi), key=f"sr_trend_{sr_tech}_{kpi}",
-                                )
+                        render_grouped_cell_trend_charts(
+                            sr_trend, sr_kpi_cols, sr_kpi_thresholds, sr_kpi_dimensions,
+                            key_prefix=f"sr_trend_{sr_tech}",
+                        )
 
                         st.divider()
                         group_label = sr_label.strip() or ', '.join(sr_picked[:3]) + \

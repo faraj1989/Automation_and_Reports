@@ -48,6 +48,20 @@ from backend.health_checker import HealthChecker
 
 logger = logging.getLogger(__name__)
 
+def autofit_excel_columns(writer, max_width: int = 60, padding: int = 2):
+    """Auto-size every column in every sheet an ExcelWriter has produced so
+    far, based on the longest header/value in that column - pandas'
+    to_excel() otherwise leaves openpyxl's generic fixed default width
+    regardless of content, requiring a manual resize in Excel. Call this
+    once, right before the `with pd.ExcelWriter(...) as writer:` block
+    closes."""
+    for ws in writer.book.worksheets:
+        for col_cells in ws.columns:
+            length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=0)
+            col_letter = col_cells[0].column_letter
+            ws.column_dimensions[col_letter].width = min(max(length + padding, 8), max_width)
+
+
 SIGNATURE_BLOCK = [
     "Faraj Ramadan Elshahaibi",
     "RF Team Leader",
@@ -662,6 +676,23 @@ class ReportGenerator:
         ]
         return {r['KPI_Name']: (float(r['Threshold']), r['Operator']) for _, r in tech_thresholds.iterrows()}
 
+    def get_trend_kpi_dimensions(self, tech: str, sheet: Optional[str] = None) -> Dict[str, str]:
+        """KPI label -> Dimension (Accessibility/Retainability/Mobility/Resource
+        Utilization/Quality), for grouping trend charts in the UI. Same
+        filtering as get_trend_kpi_thresholds - see that method for the
+        `sheet` argument's meaning."""
+        thresholds = self.health_checker.thresholds
+        if thresholds is None:
+            return {}
+        sheet = sheet or SCORECARD_SHEETS.get(tech)
+        if not sheet:
+            return {}
+        tech_thresholds = thresholds[
+            (thresholds['Technology'] == tech) &
+            (thresholds['Source_Sheet'].str.contains(sheet, na=False))
+        ]
+        return {r['KPI_Name']: r['Dimension'] for _, r in tech_thresholds.iterrows()}
+
     def resolve_group_to_cells(self, tech: str, group_names: List[str],
                                 group_col: Optional[str] = None) -> List[str]:
         """All Cell Name values belonging to the given site(s) - lets callers
@@ -798,9 +829,7 @@ class ReportGenerator:
 
         if freshness is not None and not freshness.empty:
             stale = freshness[freshness['Status'].str.contains('🔴|🟡')]
-            if stale.empty:
-                lines.append("Data Freshness: 🟢 all sources current")
-            else:
+            if not stale.empty:
                 lines.append(f"Data Freshness: ⚠️ {len(stale)} source(s) behind — see Data Freshness section")
 
         return lines
@@ -846,7 +875,7 @@ class ReportGenerator:
         lines.append("Dear Team,")
         lines.append("")
         lines.append("Please find below the daily Network Performance Summary for "
-                      f"{target_date} (2G/3G/4G, EAST Region).")
+                      f"{target_date} (2G/3G/4G).")
         lines.append("")
 
         lines.append("📈 NETWORK SUMMARY")
@@ -1003,6 +1032,8 @@ class ReportGenerator:
                 if tdf is not None and not tdf.empty:
                     tdf.to_excel(writer, sheet_name=label, index=False)
 
+            autofit_excel_columns(writer)
+
         logger.info(f"✅ Excel report saved: {filepath}")
         return filepath
 
@@ -1034,9 +1065,21 @@ class ReportGenerator:
         table.style = 'Table Grid'
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
+        # Stretch the table to fill the full printable page width instead of
+        # Word's default narrow fixed-width columns - autofit must be off
+        # for an explicit width to stick, and python-docx needs the width
+        # set on every cell (not just table.columns) or Word ignores it.
+        table.autofit = False
+        section = doc.sections[0]
+        usable_width = section.page_width - section.left_margin - section.right_margin
+        col_width = int(usable_width / len(display_df.columns))
+        for col in table.columns:
+            col.width = col_width
+
         hdr_cells = table.rows[0].cells
         for i, col in enumerate(display_df.columns):
             hdr_cells[i].text = str(col)
+            hdr_cells[i].width = col_width
             self._docx_shade_cell(hdr_cells[i], '1F4E78')
             for p in hdr_cells[i].paragraphs:
                 for run in p.runs:
@@ -1049,6 +1092,7 @@ class ReportGenerator:
             for i, col in enumerate(display_df.columns):
                 val = str(row[col])
                 cells[i].text = val
+                cells[i].width = col_width
                 for p in cells[i].paragraphs:
                     for run in p.runs:
                         run.font.size = Pt(9)
@@ -1162,7 +1206,7 @@ class ReportGenerator:
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for run in title.runs:
             run.font.color.rgb = RGBColor(0x1F, 0x4E, 0x78)
-        sub = doc.add_paragraph(f"{target_date}  |  Region: EAST")
+        sub = doc.add_paragraph(f"{target_date}")
         sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
         sub.runs[0].font.size = Pt(12)
         sub.runs[0].font.bold = True
@@ -1171,7 +1215,7 @@ class ReportGenerator:
         doc.add_paragraph("Dear Team,")
         doc.add_paragraph(
             f"Please find below the daily Network Performance Summary for {target_date} "
-            "(2G/3G/4G, EAST Region)."
+            "(2G/3G/4G)."
         )
 
         # Site summary (Date | Region | On Air Sites | 2G | 3G | 4G)

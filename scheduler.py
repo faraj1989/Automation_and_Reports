@@ -6,6 +6,8 @@ Full automation pipeline: FTP download → Processing → Health → Email
 
 import os
 import sys
+import socket
+import subprocess
 import logging
 import time
 from datetime import datetime, timedelta
@@ -54,6 +56,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DASHBOARD_PORT = 8501
+DASHBOARD_BAT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_dashboard.bat")
+
 
 class DailyScheduler:
     def __init__(self):
@@ -74,6 +79,13 @@ class DailyScheduler:
         start_time = time.time()
 
         try:
+            # Step 0: Make sure the live dashboard is actually up - it's a
+            # separate always-on web server, not a pipeline step, so nothing
+            # else in this run depends on it, but it can silently die (closed
+            # window, crash) between runs with nothing else noticing.
+            logger.info("📊 Step 0: Checking dashboard is running...")
+            self._ensure_dashboard_running()
+
             # Step 1: FTP Download
             logger.info("📥 Step 1: Downloading from FTP...")
             if not self._download_ftp(target_date):
@@ -244,6 +256,41 @@ class DailyScheduler:
         logger.info(f"Report Excel: {report_excel}")
         logger.info(f"Report Word: {report_word}")
 
+    def _is_dashboard_running(self, port=DASHBOARD_PORT, timeout=1.5):
+        """True if something is already listening on the dashboard's port
+        (the dashboard is a persistent web server, not a pipeline step -
+        this just checks it's alive, it doesn't validate it's actually
+        streamlit_dashboard.py answering)."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex(('127.0.0.1', port)) == 0
+
+    def _ensure_dashboard_running(self):
+        """Self-healing check: the dashboard should always be up, but it's
+        an independent long-running process (not something this script
+        starts and waits on) that can silently die - closed window, crash,
+        machine woke from sleep without it - between runs with nothing
+        else noticing. Relaunches run_dashboard.bat in its own detached
+        console window (same as double-clicking it) if it's not listening."""
+        if self._is_dashboard_running():
+            logger.info(f"   ✅ Dashboard already running on port {DASHBOARD_PORT}")
+            return
+
+        if not os.path.exists(DASHBOARD_BAT):
+            logger.warning(f"   ⚠️ Dashboard not running and {DASHBOARD_BAT} not found - can't auto-start")
+            return
+
+        logger.warning(f"   ⚠️ Dashboard not running on port {DASHBOARD_PORT} - restarting it")
+        try:
+            subprocess.Popen(
+                ['cmd', '/c', 'start', 'Libyana Dashboard', DASHBOARD_BAT],
+                cwd=os.path.dirname(DASHBOARD_BAT),
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            logger.info("   ✅ Dashboard relaunch triggered")
+        except Exception as e:
+            logger.error(f"   ❌ Failed to relaunch dashboard: {e}")
+
     # ------------------------------------------------------------------
     # Hourly cells update - lightweight, independently-schedulable path.
     # Separate from run() because scheduler.py has no internal interval
@@ -299,6 +346,7 @@ class DailyScheduler:
         start_time = time.time()
 
         try:
+            self._ensure_dashboard_running()
             self._download_latest_ftp_files()
             self._process_hourly_cells()
 
