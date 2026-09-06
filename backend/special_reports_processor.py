@@ -12,6 +12,7 @@ itself allows.
 import os
 import re
 import json
+import math
 import logging
 import functools
 import pandas as pd
@@ -155,14 +156,17 @@ def build_subscribers_report(csv_folder='output/csv') -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(['year', 'Week no']).reset_index(drop=True)
 
 
-def build_prb_bucket_report(csv_folder='output/csv', min_days_per_cell_month=10) -> pd.DataFrame:
+def build_prb_bucket_report(csv_folder='output/csv', min_days_per_cell_month=10, df=None) -> pd.DataFrame:
     """4G Cell Prb Dl ut(%) sheet: majority DL-PRB-utilization bucket per
     cell per month, EAST only, from output/csv/4G_Cell_BH.csv (already
     busy-hour, one value per cell per day - the original script's own
     "already matches the criteria" note). Criteria: Availability >99% (or
     missing - kept per the original script's NIL-handling), >=10 valid
-    days in the month, majority bucket wins ties toward the higher bucket."""
-    df = _load_csv(csv_folder, '4G_Cell_BH')
+    days in the month, majority bucket wins ties toward the higher bucket.
+
+    `df` lets build_nq_template_report() pass an already-loaded
+    4G_Cell_BH frame instead of re-reading it from disk."""
+    df = _load_csv(csv_folder, '4G_Cell_BH') if df is None else df
     if df is None or 'Cell Name' not in df.columns:
         return pd.DataFrame()
 
@@ -225,7 +229,7 @@ def build_prb_bucket_report(csv_folder='output/csv', min_days_per_cell_month=10)
     return pd.DataFrame(rows)
 
 
-def build_high_prb_cells_report(csv_folder='output/csv', min_days_per_cell_week=4) -> pd.DataFrame:
+def build_high_prb_cells_report(csv_folder='output/csv', min_days_per_cell_week=4, df=None) -> pd.DataFrame:
     """Cells with High DL PRB (EAST) sheet: weekly (Sun-Sat, matching the
     template's existing date-range format) listing of individual cells
     whose majority DL-PRB bucket that week is 90-100%, with coordinates
@@ -235,8 +239,11 @@ def build_high_prb_cells_report(csv_folder='output/csv', min_days_per_cell_week=
 
     `min_days_per_cell_week` (default 4 of a possible 7) is a judgment
     call, not from your original script (which only defined a monthly
-    threshold) - adjust if you want a different bar."""
-    df = _load_csv(csv_folder, '4G_Cell_BH')
+    threshold) - adjust if you want a different bar.
+
+    `df` lets build_nq_template_report() pass an already-loaded
+    4G_Cell_BH frame instead of re-reading it from disk."""
+    df = _load_csv(csv_folder, '4G_Cell_BH') if df is None else df
     if df is None or 'Cell Name' not in df.columns:
         return pd.DataFrame()
 
@@ -307,11 +314,14 @@ def build_high_prb_cells_report(csv_folder='output/csv', min_days_per_cell_week=
     return pd.DataFrame(rows).sort_values(['Date', 'Cell Name']).reset_index(drop=True)
 
 
-def build_cell_data_report(csv_folder='output/csv', throughput_threshold=3, prb_threshold=70) -> pd.DataFrame:
+def build_cell_data_report(csv_folder='output/csv', throughput_threshold=3, prb_threshold=70, df=None) -> pd.DataFrame:
     """Cell Data sheet: daily count of EAST 4G cells above the DL
     throughput / PRB utilization thresholds, plus total cell count, from
-    output/csv/4G_Cell_BH.csv."""
-    df = _load_csv(csv_folder, '4G_Cell_BH')
+    output/csv/4G_Cell_BH.csv.
+
+    `df` lets build_nq_template_report() pass an already-loaded
+    4G_Cell_BH frame instead of re-reading it from disk."""
+    df = _load_csv(csv_folder, '4G_Cell_BH') if df is None else df
     if df is None or 'Cell Name' not in df.columns:
         return pd.DataFrame()
 
@@ -342,64 +352,116 @@ _3G_BAND_MAP = {3054: 900, 3062: 900, 3075: 900, 10562: 2100, 10587: 2100}
 _4G_BAND_MAP = {1: 2100, 3: 1800, 8: 900, 28: 700}
 
 
-def _interference_month_cols(dates: pd.Series):
+INTERFERENCE_PERIODS = ('day', 'week', 'month', 'quarter')
+
+# "More than 5 bad days" in a ~30-day month is really a ~1-in-5-days (20%)
+# recurrence bar, meant to separate persistent external interference from a
+# one-off blip. Scaling that same duty cycle to whatever window the report
+# is grouped by - instead of leaving the day-count frozen at "5" - keeps a
+# flagged cell meaning the same thing at every granularity: a "day" view
+# degenerates to "was it bad that day", a "quarter" view still demands
+# roughly 1-in-5 days bad rather than becoming toothless over ~90 days.
+_GSM_BAD_DAY_DUTY_CYCLE = 0.2
+
+
+def _min_bad_days(period_days) -> int:
+    return max(1, math.ceil(period_days * _GSM_BAD_DAY_DUTY_CYCLE))
+
+
+def _period_cols(dates: pd.Series, period: str):
+    """Returns (year_col, label_col, sort_key_col) for grouping at the
+    requested granularity. 'month' reproduces the original Year/Month
+    behaviour (label = full month name); 'day'/'week'/'quarter' are the
+    dashboard's additional zoom levels. sort_key is always a real
+    chronological ordinal, separate from label - sorting by the 'month'
+    label string directly would put "August" before "July" before
+    "September" (plain alphabetical), not calendar order."""
     year = dates.dt.year
-    month_name = dates.dt.strftime('%B')
-    return year, month_name
+    if period == 'day':
+        label = dates.dt.strftime('%Y-%m-%d')
+        sort_key = label
+    elif period == 'week':
+        iso = dates.dt.isocalendar()
+        sort_key = iso.week.astype(int)
+        label = 'W' + iso.week.astype(str).str.zfill(2)
+    elif period == 'quarter':
+        sort_key = dates.dt.quarter
+        label = 'Q' + sort_key.astype(str)
+    else:
+        sort_key = dates.dt.month
+        label = dates.dt.strftime('%B')
+    return year, label, sort_key
 
 
-def build_external_interference_report(csv_folder='output/csv',
-                                        gsm_daily_threshold=5, gsm_min_bad_days=5,
+def build_external_interference_report(csv_folder='output/csv', period='month',
+                                        gsm_daily_threshold=5,
                                         umts_lte_hourly_threshold_hours=6) -> pd.DataFrame:
-    """External Interference sheet, EAST only, one section per technology:
+    """External Interference sheet, EAST only, one section per technology,
+    sourced from the dedicated interference report archived weekly by
+    backend/interference_processor.py (2G_Interference.csv /
+    3G_Interference_Hourly.csv / 4G_Interference_Hourly.csv), grouped at
+    the requested `period` ('day'/'week'/'month'/'quarter'; default
+    'month' matches the original behaviour):
 
-    - 2G: from 2G_Cell_Hourly.csv. Band from 'DL frequency' (already
-      GSM900/DCS1800 text). A cell/day counts as "bad" if that day's mean
-      Interference Band Proportion (4~5)(%) > 5 (your script's daily
-      threshold); a cell counts toward the month's total if it had MORE
-      THAN 5 such bad days that month (your template's criteria note -
-      the pasted script itself didn't implement this day-count, only the
-      note did, so this reconciles the two).
-    - 3G: from 3G_Cell_Hourly.csv. VS.MeanRTWP > -95dBm counts as an
-      "interfered hour"; a cell counts if ANY single day had >=6 such
-      hours (exactly your process_3g_interference rule). Band from 'DL
-      frequency' via the same frequency->band table your script used.
-    - 4G: from 4G_Cell_Hourly.csv. L.UL.Interference.Avg(dBm) > -100dBm
-      counts as an "interfered hour", same >=6-hours-in-a-day rule. Band
-      from 'Frequency band' (a band index, not the raw EARFCN channel
-      number 'Downlink EARFCN' - your script's {1,3,8,28} mapping matches
-      this column, not EARFCN itself)."""
+    - 2G: from 2G_Interference.csv - already one row per cell per day, no
+      hourly averaging needed. Band from 'DL frequency' (GSM900/DCS1800
+      text). A cell/day counts as "bad" if that day's Interference Band
+      Proportion (4~5)(%) > 5 (gsm_daily_threshold); a cell counts toward
+      the period's total if its number of bad days clears a duty-cycle
+      bar scaled to the period's length (see _min_bad_days).
+    - 3G: from 3G_Interference_Hourly.csv. VS.MeanRTWP > -95dBm counts as
+      an "interfered hour"; a cell counts if ANY single day within the
+      period had >=6 such hours (exactly the original
+      process_3g_interference rule) - this is already a per-day event so
+      it needs no duty-cycle scaling, just a different grouping window.
+      Band from 'DL frequency' via the same frequency->band table.
+    - 4G: from 4G_Interference_Hourly.csv. L.UL.Interference.Avg(dBm) >
+      -100dBm counts as an "interfered hour", same >=6-hours-in-a-day
+      rule. Band from 'Frequency band' (a band index, not the raw EARFCN
+      channel number)."""
+    if period not in INTERFERENCE_PERIODS:
+        raise ValueError(f"period must be one of {INTERFERENCE_PERIODS}, got {period!r}")
+
     rows = []
 
     # ---- 2G ----
-    df2 = _load_csv(csv_folder, '2G_Cell_Hourly')
+    df2 = _load_csv(csv_folder, '2G_Interference')
     if df2 is not None and 'DL frequency' in df2.columns:
         df2 = df2.copy()
-        df2['Date'] = pd.to_datetime(df2['Time'], errors='coerce').dt.floor('D')
+        df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce').dt.floor('D')
         df2 = df2.dropna(subset=['Date'])
         df2['_interf'] = pd.to_numeric(df2['Interference Band Proportion (4~5)(%)'], errors='coerce')
 
-        daily = df2.groupby(['Cell Name', 'DL frequency', 'Date'])['_interf'].mean().reset_index()
-        year, month_name = _interference_month_cols(daily['Date'])
-        daily['Year'], daily['Month'] = year, month_name
+        year, label, sort_key = _period_cols(df2['Date'], period)
+        df2['Year'], df2['Period'], df2['SortKey'] = year, label, sort_key
 
-        total_per_band = daily.groupby(['Year', 'Month', 'DL frequency'])['Cell Name'].nunique()
+        total_per_band = df2.groupby(['Year', 'Period', 'DL frequency'])['Cell Name'].nunique()
+        period_days = df2.groupby(['Year', 'Period'])['Date'].nunique()
+        sort_key_map = df2.groupby(['Year', 'Period'])['SortKey'].first()
 
-        bad_days = daily[daily['_interf'] > gsm_daily_threshold]
-        bad_day_counts = bad_days.groupby(['Cell Name', 'DL frequency', 'Year', 'Month']).size().reset_index(name='BadDays')
-        interfered = bad_day_counts[bad_day_counts['BadDays'] > gsm_min_bad_days]
-        interfered_per_band = interfered.groupby(['Year', 'Month', 'DL frequency'])['Cell Name'].nunique()
+        bad_days = df2[df2['_interf'] > gsm_daily_threshold]
+        bad_day_counts = bad_days.groupby(['Cell Name', 'DL frequency', 'Year', 'Period']).size().reset_index(name='BadDays')
+        if not bad_day_counts.empty:
+            bad_day_counts['MinBadDays'] = [
+                _min_bad_days(period_days.get((y, p), 1))
+                for y, p in zip(bad_day_counts['Year'], bad_day_counts['Period'])
+            ]
+            interfered = bad_day_counts[bad_day_counts['BadDays'] >= bad_day_counts['MinBadDays']]
+            interfered_per_band = interfered.groupby(['Year', 'Period', 'DL frequency'])['Cell Name'].nunique()
+        else:
+            interfered_per_band = pd.Series(dtype=int)
 
-        for (year, month, band), total in total_per_band.items():
-            count = interfered_per_band.get((year, month, band), 0)
-            rows.append({'year': year, 'week': month, 'Tech Type': '2G', 'Branch': BRANCH,
+        for (year, label_, band), total in total_per_band.items():
+            count = interfered_per_band.get((year, label_, band), 0)
+            rows.append({'year': year, 'week': label_, 'SortKey': sort_key_map[(year, label_)],
+                         'Tech Type': '2G', 'Branch': BRANCH,
                          'Band': band, 'Count of Cells with External interference': count,
                          'Total count of cells': total})
 
     # ---- 3G / 4G (shared shape: hourly threshold -> interfered-hours/day -> any day >= N hours) ----
     for tech, sheet, metric_col, threshold, band_col, band_map in [
-        ('3G', '3G_Cell_Hourly', 'VS.MeanRTWP', -95, 'DL frequency', _3G_BAND_MAP),
-        ('4G', '4G_Cell_Hourly', 'L.UL.Interference.Avg(dBm)', -100, 'Frequency band', _4G_BAND_MAP),
+        ('3G', '3G_Interference_Hourly', 'VS.MeanRTWP', -95, 'DL frequency', _3G_BAND_MAP),
+        ('4G', '4G_Interference_Hourly', 'L.UL.Interference.Avg(dBm)', -100, 'Frequency band', _4G_BAND_MAP),
     ]:
         df = _load_csv(csv_folder, sheet)
         if df is None or band_col not in df.columns or metric_col not in df.columns:
@@ -412,39 +474,43 @@ def build_external_interference_report(csv_folder='output/csv',
         df = df.dropna(subset=['Band'])
         df['_is_interfered_hour'] = df['_metric'] > threshold
 
-        year, month_name = _interference_month_cols(df['Date'])
-        df['Year'], df['Month'] = year, month_name
+        year, label, sort_key = _period_cols(df['Date'], period)
+        df['Year'], df['Period'], df['SortKey'] = year, label, sort_key
 
-        total_per_band = df.groupby(['Year', 'Month', 'Band'])['Cell Name'].nunique()
+        total_per_band = df.groupby(['Year', 'Period', 'Band'])['Cell Name'].nunique()
+        sort_key_map = df.groupby(['Year', 'Period'])['SortKey'].first()
 
-        daily_hours = df.groupby(['Cell Name', 'Band', 'Year', 'Month', 'Date'])['_is_interfered_hour'].sum().reset_index(name='Hours')
+        daily_hours = df.groupby(['Cell Name', 'Band', 'Year', 'Period', 'Date'])['_is_interfered_hour'].sum().reset_index(name='Hours')
         bad_cell_days = daily_hours[daily_hours['Hours'] >= umts_lte_hourly_threshold_hours]
-        interfered_cells = bad_cell_days[['Cell Name', 'Band', 'Year', 'Month']].drop_duplicates()
-        interfered_per_band = interfered_cells.groupby(['Year', 'Month', 'Band'])['Cell Name'].nunique()
+        interfered_cells = bad_cell_days[['Cell Name', 'Band', 'Year', 'Period']].drop_duplicates()
+        interfered_per_band = interfered_cells.groupby(['Year', 'Period', 'Band'])['Cell Name'].nunique()
 
-        for (year, month, band), total in total_per_band.items():
-            count = interfered_per_band.get((year, month, band), 0)
-            rows.append({'year': year, 'week': month, 'Tech Type': tech, 'Branch': BRANCH,
+        for (year, label_, band), total in total_per_band.items():
+            count = interfered_per_band.get((year, label_, band), 0)
+            rows.append({'year': year, 'week': label_, 'SortKey': sort_key_map[(year, label_)],
+                         'Tech Type': tech, 'Branch': BRANCH,
                          'Band': int(band), 'Count of Cells with External interference': count,
                          'Total count of cells': total})
 
-    result = pd.DataFrame(rows).sort_values(['year', 'week', 'Tech Type', 'Band']).reset_index(drop=True)
+    result = pd.DataFrame(rows).sort_values(['year', 'SortKey', 'Tech Type', 'Band']).reset_index(drop=True)
+    result = result.drop(columns=['SortKey'])
     # 2G's Band is text ('GSM900'/'DCS1800') while 3G/4G's is an int MHz value (900/1800/2100/700) -
     # mixing both in one object column is what Streamlit's Arrow conversion above was choking on.
     result['Band'] = result['Band'].astype(str)
     return result
 
 
-def build_nq_template_report(csv_folder='output/csv') -> dict:
+def build_nq_template_report(csv_folder='output/csv', interference_period='month') -> dict:
     """All currently-ready NQ Data Collection Template sheets, EAST only.
     Network Daily KPI's still needs column-by-column source confirmation
     for a few columns (Gi Interface is settled; E-RAB/RRC Drop Rate, Max
     RRC Connection User, and Packet Loss Rate meaning are still open) and
     isn't included yet."""
+    bh_4g = _load_csv(csv_folder, '4G_Cell_BH')
     return {
         'Subscribers': build_subscribers_report(csv_folder),
-        '4G Cell Prb Dl ut(%)': build_prb_bucket_report(csv_folder),
-        'Cell Data': build_cell_data_report(csv_folder),
-        'Cells with High DL PRB (EAST)': build_high_prb_cells_report(csv_folder),
-        'External Interference': build_external_interference_report(csv_folder),
+        '4G Cell Prb Dl ut(%)': build_prb_bucket_report(csv_folder, df=bh_4g),
+        'Cell Data': build_cell_data_report(csv_folder, df=bh_4g),
+        'Cells with High DL PRB (EAST)': build_high_prb_cells_report(csv_folder, df=bh_4g),
+        'External Interference': build_external_interference_report(csv_folder, period=interference_period),
     }

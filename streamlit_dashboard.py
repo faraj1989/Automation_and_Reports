@@ -94,6 +94,21 @@ def cached_cell_trend(tech, cell_names, target_date):
 
 
 @st.cache_data(ttl=600)
+def cached_cell_trend_range(tech, cell_names, start_date, end_date):
+    return rg.build_cell_trend(tech, list(cell_names), start_date=start_date, end_date=end_date)
+
+
+@st.cache_data(ttl=600)
+def cached_resolve_group_to_cells(tech, group_names, group_col):
+    return rg.resolve_group_to_cells(tech, list(group_names), group_col=group_col)
+
+
+@st.cache_data(ttl=600)
+def cached_network_summary(target_date):
+    return rg.build_network_summary_block(target_date)
+
+
+@st.cache_data(ttl=600)
 def cached_worst_cells(target_date, n_top):
     return rg.build_worst_cells(target_date, n_top=n_top)
 
@@ -164,14 +179,14 @@ def cached_excel_bytes(target_date, previous_date):
 
 
 @st.cache_data(ttl=600)
-def cached_nq_template():
-    return build_nq_template_report()
+def cached_nq_template(interference_period='month'):
+    return build_nq_template_report(interference_period=interference_period)
 
 
 @st.cache_data(ttl=600)
-def cached_nq_template_bytes():
+def cached_nq_template_bytes(interference_period='month'):
     import io
-    sheets = cached_nq_template()
+    sheets = cached_nq_template(interference_period)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         for sheet_name, df in sheets.items():
@@ -682,7 +697,7 @@ elif section == "🔎 Investigate":
 
                 if picked:
                     if pick_col == site_col:
-                        selected = rg.resolve_group_to_cells(explore_tech, picked, group_col=site_col)
+                        selected = cached_resolve_group_to_cells(explore_tech, tuple(picked), site_col)
                         st.caption(f"Resolved to {len(selected)} cell(s)/sector(s) under {len(picked)} selected site(s).")
                     else:
                         selected = picked
@@ -781,7 +796,7 @@ elif section == "🔎 Investigate":
                 st.error("Start date is after end date.")
             else:
                 if sr_pick_col == sr_site_col:
-                    sr_cells = rg.resolve_group_to_cells(sr_tech, sr_picked, group_col=sr_site_col)
+                    sr_cells = cached_resolve_group_to_cells(sr_tech, tuple(sr_picked), sr_site_col)
                     st.caption(f"Resolved to {len(sr_cells)} cell(s)/sector(s) under {len(sr_picked)} selected site(s).")
                 else:
                     sr_cells = sr_picked
@@ -789,7 +804,7 @@ elif section == "🔎 Investigate":
                 if not sr_cells:
                     st.warning("No cells found for the selected group.")
                 else:
-                    sr_trend = rg.build_cell_trend(sr_tech, sr_cells, start_date=sr_start, end_date=sr_end)
+                    sr_trend = cached_cell_trend_range(sr_tech, tuple(sr_cells), sr_start, sr_end)
                     if sr_trend is None or sr_trend.empty:
                         st.info("No data available for this group/date range.")
                     else:
@@ -799,15 +814,15 @@ elif section == "🔎 Investigate":
                                      width='stretch', hide_index=True)
 
                         st.subheader("⚠️ Failing KPIs & Suggested Fixes")
-                        sr_failing = rg.get_cell_failing_kpis(sr_tech, sr_cells, latest_date)
+                        sr_failing = cached_cell_failing(sr_tech, tuple(sr_cells), latest_date)
                         if sr_failing is not None and not sr_failing.empty:
                             st.dataframe(sr_failing, width='stretch', hide_index=True)
                         else:
                             st.success("No threshold KPIs are failing for this group on the latest date.")
 
                         st.subheader(f"📈 Trend ({sr_start} to {sr_end})")
-                        sr_kpi_thresholds = rg.get_trend_kpi_thresholds(sr_tech, sheet=sr_sheet)
-                        sr_kpi_dimensions = rg.get_trend_kpi_dimensions(sr_tech, sheet=sr_sheet)
+                        sr_kpi_thresholds = cached_cell_thresholds(sr_tech, sr_sheet)
+                        sr_kpi_dimensions = cached_cell_dimensions(sr_tech, sr_sheet)
                         sr_kpi_cols = [c for c in sr_trend.columns if c not in ('Date', 'Cell')]
                         render_grouped_cell_trend_charts(
                             sr_trend, sr_kpi_cols, sr_kpi_thresholds, sr_kpi_dimensions,
@@ -845,11 +860,20 @@ elif section == "📋 HQ Reports":
 
     with sec_tabs[0]:
         st.caption("EAST branch only, built from output/csv/ history. Not included yet: "
-                   "Network Daily KPI's (a few columns still need source confirmation). "
-                   "External Interference's 2G row will read 0 until 2G_Cell_Hourly.csv has "
-                   "more than 5 days of history - the >5-bad-days rule can't fire yet, not a bug.")
+                   "Network Daily KPI's (a few columns still need source confirmation).")
 
-        nq_sheets = cached_nq_template()
+        period_labels = {'Day': 'day', 'Week': 'week', 'Month': 'month', 'Quarter': 'quarter'}
+        period_choice = st.radio(
+            "External Interference period", list(period_labels.keys()), index=2,
+            horizontal=True,
+            help="Only affects the External Interference table below. The bad-day "
+                 "persistence bar scales with the chosen window (~1-in-5 days bad, "
+                 "same duty cycle at every granularity) rather than staying frozen "
+                 "at the monthly '>5 days' count.",
+        )
+        interference_period = period_labels[period_choice]
+
+        nq_sheets = cached_nq_template(interference_period)
 
         sheet_tabs = st.tabs(list(nq_sheets.keys()))
         for sheet_tab, (sheet_name, df) in zip(sheet_tabs, nq_sheets.items()):
@@ -863,7 +887,7 @@ elif section == "📋 HQ Reports":
         st.divider()
         st.download_button(
             "⬇️ Download NQ Data Collection Template (.xlsx)",
-            data=cached_nq_template_bytes(),
+            data=cached_nq_template_bytes(interference_period),
             file_name=f"NQ_Data_Collection_Template_{target_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
@@ -877,7 +901,7 @@ elif section == "📧 Reports":
 
     with sec_tabs[0]:
         st.subheader("📈 Network Summary")
-        summary_rows = rg.build_network_summary_block(target_date)
+        summary_rows = cached_network_summary(target_date)
         c1, c2 = st.columns(2)
         for i, (label, value) in enumerate(summary_rows):
             (c1 if i % 2 == 0 else c2).metric(label, value)

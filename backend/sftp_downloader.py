@@ -146,9 +146,18 @@ class SFTPDownloader:
         - Suffix: "(2G)"
         - Identifier: "234G Cell info Daily2026(2G)"
         """
-        base = self.get_base_name_from_filename(filename)
         suffix = self.extract_csv_suffix(filename)
         if suffix:
+            # get_base_name_from_filename only strips the trailing
+            # _TIMESTAMP-TIMESTAMP when it's at the very end of the name -
+            # true for zip files, but every extracted CSV ends in
+            # "(suffix).csv" instead, so the timestamp sits before the
+            # suffix and never gets stripped. Drop "(suffix).csv" first so
+            # the timestamp is back at the true end before stripping it -
+            # otherwise every run's new end-timestamp makes each CSV look
+            # like a brand new identifier and old copies never get cleaned.
+            stem = filename[: -(len(suffix) + len('.csv'))]
+            base = self.get_base_name_from_filename(stem + '.csv')
             return f"{base}{suffix}"
         # If no suffix, use full filename (without extension)
         return filename.rsplit('.', 1)[0]
@@ -224,6 +233,30 @@ class SFTPDownloader:
                     self.log(f"🗑️ Deleted duplicate CSV: {f}")
                 except Exception as e:
                     self.log(f"⚠️ Could not delete {f}: {e}")
+
+    def cleanup_old_remote_duplicates(self, base_name, keep_filename):
+        """
+        Delete older remote zip files sharing `base_name`, keeping only
+        `keep_filename` (the one just downloaded and processed locally).
+        Best-effort: a failed remote delete is logged and skipped rather
+        than raised, so it can't take down the rest of the run.
+        """
+        try:
+            remote_files = self.sftp.listdir()
+        except Exception as e:
+            self.log(f"⚠️ Could not list remote files for cleanup: {e}")
+            return
+
+        for fname in remote_files:
+            if fname == keep_filename or not fname.lower().endswith('.zip'):
+                continue
+            if self.get_base_name_from_filename(fname) != base_name:
+                continue
+            try:
+                self.sftp.remove(fname)
+                self.log(f"🗑️ Deleted old remote file: {fname}")
+            except Exception as e:
+                self.log(f"⚠️ Could not delete remote {fname}: {e}")
 
     def download_and_organize(self, target_date=None):
         """
@@ -340,6 +373,14 @@ class SFTPDownloader:
                 # STEP 8: Clean up duplicate CSVs (keep one per technology)
                 # ============================================================
                 self.cleanup_old_csv_duplicates(unzipped_folder, base_name)
+
+                # ============================================================
+                # STEP 9: Now that the new file is safely downloaded and
+                # unzipped, delete older remote versions of this same report
+                # to keep FTP storage flat (rolling-window reports otherwise
+                # accumulate one new zip per fetch forever).
+                # ============================================================
+                self.cleanup_old_remote_duplicates(base_name, fname)
 
                 processed_count += 1
                 self.log(f"✅ Done: {fname}")

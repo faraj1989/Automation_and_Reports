@@ -6,6 +6,7 @@ Combines all CSVs into a single Excel file at the end.
 """
 
 import os
+import time
 import logging
 import pandas as pd
 from datetime import datetime
@@ -77,19 +78,31 @@ class CSVHistoryManager:
                 return pd.DataFrame()
         return pd.DataFrame()
 
-    def _write_csv(self, sheet_name, df):
-        """Write a DataFrame to CSV."""
+    def _write_csv(self, sheet_name, df, retries=4, retry_delay=3):
+        """Write a DataFrame to CSV.
+
+        Retries on PermissionError: on Windows these large hourly files get
+        briefly locked by antivirus/indexer scans right after being read,
+        and a write landing in that window shouldn't fail the whole run."""
         if df is None or df.empty:
             logger.warning(f"No data to write to {sheet_name}")
             return
 
         csv_path = self._get_csv_path(sheet_name)
-        try:
-            df.to_csv(csv_path, index=False)
-            logger.info(f"✅ Wrote {len(df)} rows to {csv_path}")
-        except Exception as e:
-            logger.error(f"Failed to write {csv_path}: {e}")
-            raise
+        for attempt in range(1, retries + 1):
+            try:
+                df.to_csv(csv_path, index=False)
+                logger.info(f"✅ Wrote {len(df)} rows to {csv_path}")
+                return
+            except PermissionError as e:
+                if attempt == retries:
+                    logger.error(f"Failed to write {csv_path} after {retries} attempts: {e}")
+                    raise
+                logger.warning(f"{csv_path} locked (attempt {attempt}/{retries}): {e}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+            except Exception as e:
+                logger.error(f"Failed to write {csv_path}: {e}")
+                raise
 
     def _append_with_dup_check(self, sheet_name, df, key_cols):
         """
@@ -360,7 +373,7 @@ class CSVHistoryManager:
         logger.info(f"Transmission KPIs: {total_new} new rows, {total_skipped} skipped")
         return total_new, total_skipped
 
-    def update_hourly_cell_kpis(self, results_dict, retention_days=14):
+    def update_hourly_cell_kpis(self, results_dict, retention_days=90):
         """Update the hourly all-cells CSVs (2G_Cell_Hourly/3G_Cell_Hourly/
         4G_Cell_Hourly). Each fetch re-sends a rolling window of mostly the
         same hours already archived, at millions of rows total, so this
@@ -390,6 +403,40 @@ class CSVHistoryManager:
             self._write_csv(sheet_name, combined)
             logger.info(f"Hourly Cell KPI {sheet_name}: {rows_before} -> {len(combined)} rows "
                         f"(retention {retention_days}d)")
+
+    def update_interference_kpis(self, results_dict):
+        """Update the dedicated external-interference archives
+        (2G_Interference/3G_Interference_Hourly/4G_Interference_Hourly).
+        Unlike update_hourly_cell_kpis, this keeps FULL history with no
+        rolling-window trim: 2G is already one row/cell/day so it stays
+        small indefinitely, and Huawei's own export already truncates
+        3G/4G to ~2-3 weeks per pull, so nothing here would even get
+        trimmed for a long time - full retention is what the monthly (and
+        longer) HQ interference criteria need. Same vectorized
+        concat+drop_duplicates approach as update_hourly_cell_kpis since
+        this is also millions-of-rows-scale for 3G/4G."""
+        if not results_dict:
+            return
+
+        key_cols_by_sheet = {
+            '2G_Interference': ['Cell Name', 'Date'],
+            '3G_Interference_Hourly': ['Cell Name', 'Time'],
+            '4G_Interference_Hourly': ['Cell Name', 'Time'],
+        }
+
+        for sheet_name, df in results_dict.items():
+            if df is None or df.empty:
+                continue
+
+            key_cols = key_cols_by_sheet.get(sheet_name, ['Cell Name', 'Time'])
+            existing = self._read_csv(sheet_name)
+            rows_before = len(existing)
+
+            combined = pd.concat([existing, df], ignore_index=True) if not existing.empty else df.copy()
+            combined = combined.drop_duplicates(subset=key_cols, keep='last')
+
+            self._write_csv(sheet_name, combined)
+            logger.info(f"Interference KPI {sheet_name}: {rows_before} -> {len(combined)} rows")
 
     def update_traffic_kpis(self, results_dict):
         """Update all traffic KPI CSVs."""
@@ -500,9 +547,18 @@ class CSVHistoryManager:
         self._append_with_dup_check('User_Summary', df, key_cols)
         logger.info(f"User Summary updated with {len(df)} rows")
     # ---------- Excel Export ----------
+    # Raw per-hour, per-cell detail (millions of rows across 2G/3G/4G).
+    # update_hourly_cell_kpis() already retains these separately as CSV for
+    # trend lookups; report_generator.py never reads them for the human
+    # report. Loading them into an openpyxl workbook here balloons process
+    # memory into the tens of GB (per-cell object overhead), so they're kept
+    # out of the combined Excel export.
+    EXCEL_EXPORT_EXCLUDE_SUFFIXES = ('_Cell_Hourly', '_Interference_Hourly')
+
     def export_to_excel(self, excel_name="Historical_Network_Data.xlsx"):
         """
-        Combine all CSV files into a single Excel workbook.
+        Combine all CSV files into a single Excel workbook, except the raw
+        hourly-cell detail sheets (see EXCEL_EXPORT_EXCLUDE_SUFFIXES).
         """
         excel_path = os.path.join(self.output_folder, excel_name)
         logger.info(f"📁 Exporting all CSVs to Excel: {excel_path}")
@@ -510,6 +566,14 @@ class CSVHistoryManager:
         try:
             # Get all CSV files
             csv_files = [f for f in os.listdir(self.csv_folder) if f.endswith('.csv')]
+
+            skipped_sheets = [
+                f for f in csv_files
+                if f[:-4].endswith(self.EXCEL_EXPORT_EXCLUDE_SUFFIXES)
+            ]
+            if skipped_sheets:
+                logger.info(f"Excluding raw hourly-detail sheets from Excel export: {skipped_sheets}")
+            csv_files = [f for f in csv_files if f not in skipped_sheets]
 
             if not csv_files:
                 logger.warning("No CSV files found to export")

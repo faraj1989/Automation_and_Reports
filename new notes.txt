@@ -1,3 +1,54 @@
+1.sorry we need tio oh  i will change the raw data i  will change it to handle another zip  file in  sftp you will find report named start with 2G_3G_4G interference and PRB utilization for Automation_2026090-20260906142108.zip  and unzipped it and do like other s csv we need to unzipd it an reads its contents and data EDA so you understandthe csv very well after that clean and archiveit in three file like 2G interference and 3g ,4g theses interference files already uploaed to sftp by huawei imaster report managemtn system each 4 am shceduled from huawei sytem so evevy 6 am will be ready to download so wou will do this task every sunday morning with the pipeline and archiveing the csvs 2,3,g interferecne data for cell level < FYI only 2G interference data already celllevel one value per day so you can aply the logic to calculate the interference , in dash board keep the default monthly table but please add an option to do that table but with otpion per week or per day or last quearter same logic in monthly table , also after taking the file from sftp i want to delete old files  for interference for last days inftp and local unzipped folder to save space becaus interference and cell level dta will be big zises , and keep  2,3,4G_Cell_Hourly.csv files as before will be quered for another tasks 
 
-what about Gi Interface Traffic  and Transmission KPIs (IUB/ABIS) the kpis already in ftp server and already downolaed at today 6:30 am  can you check them  
+
+prombt done,
+
+
+
+2.what about Gi Interface Traffic  and Transmission KPIs (IUB/ABIS) the kpis already in ftp server and already downolaed at today 6:30 am  can you check them  
 can you review and confirm they while we wating for the 1200 hours cells file to be downloaded 
+
+3. in the investigate tab in  cell export and special report tabs  to be updated like Filter by Cell Name / Site Name contains... 
+i want to show the SiteDetail from SiteDetail to the selected site or sites and show Site Name	2G GSM900 Band	2G DCS1800 Band	3G U2100 Band	3G U900 Band	4G L1800 F1 Band	4G L1800 F2 Band	4G L2100 Band	4G L900 Band	4G L700 Band	Scenario	RAT	Sectors Number	Current RAT	Last Updated
+COAST201(FTTS)	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			2T3S(2T2R)	GUL	21	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA034(FTTS)	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			4T6S	GUL	33	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA049	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			2T3S(2T2R)	GUL	21	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA030	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			4T6S	GUL	33	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA023(FTTS)	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			2T3S(2T2R)	GUL	21	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA019	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			2T3S(2T2R)	GUL	21	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA017(FN)	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			4T6S	GUL	33	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+BYDA013	GSM900	DCS1800	U2100		L1800 (20MHz)		L2100 (20MHz)			2T3S(2T2R)	GUL	15	GSM900+DCS1800+U2100++L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+NFLYA001(FN)	GSM900	DCS1800		U900	L1800 (20MHz)					2T3S(2T2R)	GUL	12	GSM900+DCS1800++U900+L1800 (20MHz)+++++	8/19/2026
+BYDA005	GSM900	DCS1800	U2100	U900	L1800 (20MHz)		L2100 (20MHz)			4T6S	GUL	33	GSM900+DCS1800+U2100+U900+L1800 (20MHz)++L2100 (20MHz)+++	8/19/2026
+
+to be more details showed to user and you suggests to user in dashboard what to do to enhnace hte capacity for example to enhance the prb ,
+also i noticed in site detailscsv the last updated Last Updated
+9/2/2026
+ just please emind me the logic to calculate the site details ,
+
+4.in the overview tab in dashboard
+
+ LTE maximum attached users
+
+519,885 this is not the max value of LTE maximum attached users in that day 5-9-2026 from where you take this number ,,,
+it should came from csv User_PS_Subscribers
+Date	Gb mode maximum attached users(number)	Iu mode maximum attached users(number)	Maximum attached users(number)	Time	Whole Network	Integrity	Hour
+5/8/2026	140537	567811	879511	5/8/2026 0:00	Whole Network	100%	
+5/9/2026	138249	573138	882859	5/9/2026 0:00	Whole Network	100%	
+5/10/2026	141356	571793	880049	5/10/2026 0:00	Whole Network	100%	
+because User_PS_Subscribers save and record archiving all max user per day in each technology for ps 
+
+
+=====
+
+
+5- also i want a SiteDetail csv to be showed in site nd infrastructure tab in dashboard you can advice recomend me how to show it in approch enhnace to user all sites or summar your recomendations
+is appreciated,
+
+6.for Topology reference loaded: i already updated the excell sheet file in the config please read the FN-HUB Info-2025-Oct FN Sites List entirely and understand it very weel and advice me how we can add it in the infrastructure tab  and how to be mentioned and and how this topology can help us in top n cells and site specialy report s and 
+in investigate tab ,
+i mean when making incestigate or special report for some sites we can mentioned or do some thing with topology sites,
+
+
+=============
+

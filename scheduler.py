@@ -6,6 +6,7 @@ Full automation pipeline: FTP download → Processing → Health → Email
 
 import os
 import sys
+import glob
 import socket
 import subprocess
 import logging
@@ -29,6 +30,7 @@ from backend.network_kpi_processor import process_network_kpis
 from backend.cell_kpi_processor import process_cell_kpis
 from backend.transmission_kpi_processor import process_transmission_kpis
 from backend.hourly_cell_processor import process_hourly_cell_kpis
+from backend.interference_processor import process_interference_kpis, INTERFERENCE_REPORT_GLOB
 from backend.traffic_kpi_processor import process_traffic_with_aggregation
 from backend.user_kpi_processor import process_user_kpis, aggregate_user_data
 from backend.site_detail_processor import generate_site_detail, get_latest_available_day
@@ -361,6 +363,98 @@ class DailyScheduler:
             logger.error(traceback.format_exc())
             return False
 
+    # ------------------------------------------------------------------
+    # Weekly external-interference update - dedicated report Huawei
+    # iMaster uploads daily (~04:00, ready ~06:00), but 3G/4G are big
+    # enough (millions of hourly rows) that we only pull it once a week;
+    # 2G is already daily cell-level granularity so nothing is lost by
+    # not fetching more often on that side. Meant to be pointed at by its
+    # own scheduled task, Sunday mornings, independent of the daily and
+    # ~6-hourly jobs above.
+    # ------------------------------------------------------------------
+
+    INTERFERENCE_REPORT_BASE_NAME = '2G_3G_4G interference and PRB utilization for Automation'
+
+    def _cleanup_local_interference_files(self):
+        """Delete the raw interference+PRB zip/CSVs from every dated
+        local folder once they're archived into output/csv/ - a single
+        week's zip is ~90MB and unzips to ~650MB, the biggest single file
+        this pipeline handles, and nothing needs the local copy once the
+        data lives in the persistent archive."""
+        local_root = self.config.get('local_root')
+        if not local_root or not os.path.exists(local_root):
+            return
+
+        removed_bytes = 0
+        for entry in os.listdir(local_root):
+            day_folder = os.path.join(local_root, entry)
+            if not os.path.isdir(day_folder):
+                continue
+
+            zipped_folder = os.path.join(day_folder, 'zipped')
+            if os.path.exists(zipped_folder):
+                for f in os.listdir(zipped_folder):
+                    if f.lower().endswith('.zip') and f.startswith(self.INTERFERENCE_REPORT_BASE_NAME):
+                        path = os.path.join(zipped_folder, f)
+                        try:
+                            removed_bytes += os.path.getsize(path)
+                            os.remove(path)
+                            logger.info(f"🗑️ Removed archived interference zip: {path}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove {path}: {e}")
+
+            unzipped_folder = os.path.join(day_folder, 'unzipped')
+            if os.path.exists(unzipped_folder):
+                for f in glob.glob(os.path.join(unzipped_folder, INTERFERENCE_REPORT_GLOB)):
+                    try:
+                        removed_bytes += os.path.getsize(f)
+                        os.remove(f)
+                        logger.info(f"🗑️ Removed archived interference CSV: {f}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove {f}: {e}")
+
+        if removed_bytes:
+            logger.info(f"🧹 Freed {removed_bytes / (1024 * 1024):.1f} MB of local interference report files")
+
+    def _process_interference_kpis(self):
+        """Archive the dedicated external-interference report (2G/3G/4G
+        cell-level interference, plus bonus 4G PRB/throughput columns)."""
+        local_root = self.config.get('local_root')
+        day_folder = get_latest_day_folder(local_root)
+
+        if day_folder:
+            results = process_interference_kpis(day_folder, log_callback=logger.info)
+            if results:
+                self.history_mgr.update_interference_kpis(results)
+
+    def run_interference_weekly_update(self):
+        """Entry point for the weekly (Sunday morning) scheduled task:
+        fetch whatever's newest on the FTP (same rolling-window fetch as
+        the hourly-cells job), archive the interference report with full
+        history retained, then free the local disk space the raw report
+        used."""
+        logger.info("=" * 70)
+        logger.info("📡 STARTING WEEKLY INTERFERENCE UPDATE")
+        logger.info("=" * 70)
+        start_time = time.time()
+
+        try:
+            self._ensure_dashboard_running()
+            self._download_latest_ftp_files()
+            self._process_interference_kpis()
+            self._cleanup_local_interference_files()
+
+            elapsed = time.time() - start_time
+            logger.info("=" * 70)
+            logger.info(f"✅ WEEKLY INTERFERENCE UPDATE COMPLETED - {elapsed:.1f} seconds")
+            logger.info("=" * 70)
+            return True
+        except Exception as e:
+            logger.error(f"❌ Weekly interference update failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
 
 def main():
     parser = argparse.ArgumentParser(description='Libyana NPM Daily Scheduler')
@@ -368,12 +462,18 @@ def main():
     parser.add_argument('--auto-send', action='store_true', help='Auto-send email')
     parser.add_argument('--hourly-cells', action='store_true',
                          help='Run only the ~6-hourly live cell KPI update, not the full daily pipeline')
+    parser.add_argument('--interference-weekly', action='store_true',
+                         help='Run only the weekly external-interference report update, not the full daily pipeline')
     args = parser.parse_args()
 
     scheduler = DailyScheduler()
 
     if args.hourly_cells:
         scheduler.run_hourly_cells_update()
+        return
+
+    if args.interference_weekly:
+        scheduler.run_interference_weekly_update()
         return
 
     if args.date:
