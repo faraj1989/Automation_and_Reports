@@ -516,3 +516,27 @@ def generate_complaint_word_report(report_gen, complainant: Dict, mode: str, ana
     doc.save(buf)
     buf.seek(0)
     return buf.read()
+
+
+# ------------------------------------------------------------------
+# Excel report
+# ------------------------------------------------------------------
+
+def generate_complaint_excel_report(report_gen, complainant: Dict, mode: str, analysis: Dict) -> bytes:
+    """Same content as generate_complaint_word_report, as .xlsx (one sheet
+    per table) - the Matched Cells / Alarm History / Interference tables can
+    run to hundreds of rows, which reads far better in Excel than in Word.
+    Reuses ReportGenerator.generate_tables_excel_report, the same generic
+    per-tab Excel export every other dashboard tab uses."""
+    findings = (pd.DataFrame({'Finding': analysis['narratives']}) if analysis['narratives']
+                else pd.DataFrame({'Finding': ["No cells could be matched to the given location/radius."]}))
+    tables = [
+        ("Complaint Details", pd.DataFrame([complainant])),
+        ("Findings", findings),
+        ("Matched Cells", analysis['cells']),
+        ("Failing KPIs", analysis['failing_kpis']),
+        ("Alarm History", analysis['alarms']),
+        ("Interference (2G)", analysis['interference']),
+    ]
+    return report_gen.generate_tables_excel_report(
+        "Network Complaint Investigation", tables, subtitle=f"Mode: {mode}")

@@ -10,6 +10,7 @@ file. Nothing about a KPI's name/threshold/weight is hardcoded here - it all
 comes from config/kpi_thresholds.csv via HealthChecker, same as the report.
 """
 
+import glob
 import os
 import sys
 from typing import Dict, List
@@ -31,6 +32,20 @@ from backend.special_reports_processor import (
 from backend.topology_processor import build_site_topology_csv, find_topology_xlsx
 from backend import smartcare_cem_processor as smartcare_cem
 from backend import complaint_analyzer
+from project_config import env_path_str
+
+# External FTPS-pulled reports (scripts/cell_info_report.py and the sibling
+# "PS Traffic per site" puller live outside this repo, in the sister
+# NOC Automation Suite project) - the dashboard only reads their finished
+# output files, same DATA_ROOT convention as every scraper in this project.
+CELL_INFO_OUTPUT_DIR = env_path_str(
+    "CELL_INFO_OUTPUT_DIR",
+    os.path.join(env_path_str("DATA_ROOT", r"C:\Users\user\Desktop\Libyana_Data"), "Output", "Cell_Info"),
+)
+PS_TRAFFIC_OUTPUT_DIR = env_path_str(
+    "PS_TRAFFIC_OUTPUT_DIR",
+    os.path.join(env_path_str("DATA_ROOT", r"C:\Users\user\Desktop\Libyana_Data"), "Output", "PS_Traffic_Output"),
+)
 
 st.set_page_config(page_title="Libyana Network Dashboard", page_icon="📊", layout="wide")
 
@@ -159,6 +174,52 @@ def cached_packet_loss_report(period, target_date):
 def cached_topology_table():
     path = os.path.join('config', 'site_topology.csv')
     return pd.read_csv(path) if os.path.exists(path) else None
+
+
+@st.cache_data(ttl=600)
+def cached_cell_info_months():
+    """Month subfolders (YYYY-MM) produced by the sibling cell_info_report.py puller."""
+    if not os.path.isdir(CELL_INFO_OUTPUT_DIR):
+        return []
+    months = [
+        d for d in os.listdir(CELL_INFO_OUTPUT_DIR)
+        if os.path.isdir(os.path.join(CELL_INFO_OUTPUT_DIR, d)) and len(d) == 7 and d[4] == '-'
+    ]
+    return sorted(months, reverse=True)
+
+
+@st.cache_data(ttl=600)
+def cached_cell_info_report(month):
+    """The merged 2G/3G/4G cell-info workbook for one month, plus its raw bytes for download."""
+    month_dir = os.path.join(CELL_INFO_OUTPUT_DIR, month)
+    candidates = sorted(
+        glob.glob(os.path.join(month_dir, f"merged_df_{month}.xlsx"))
+        or glob.glob(os.path.join(month_dir, "merged_df_*.xlsx")),
+        key=os.path.getmtime, reverse=True,
+    )
+    if not candidates:
+        return None, None, None
+    path = candidates[0]
+    with open(path, 'rb') as f:
+        raw_bytes = f.read()
+    return pd.read_excel(path), os.path.basename(path), raw_bytes
+
+
+@st.cache_data(ttl=600)
+def cached_ps_traffic_report():
+    """The combined PS-traffic-per-site workbook (all sheets) from the sibling puller."""
+    candidates = sorted(
+        glob.glob(os.path.join(PS_TRAFFIC_OUTPUT_DIR, "Combined_Traffic_Report.xlsx"))
+        or glob.glob(os.path.join(PS_TRAFFIC_OUTPUT_DIR, "PS_Traffic_Combined_Report_*.xlsx")),
+        key=os.path.getmtime, reverse=True,
+    )
+    if not candidates:
+        return None, None, None
+    path = candidates[0]
+    sheets = pd.read_excel(path, sheet_name=None)
+    with open(path, 'rb') as f:
+        raw_bytes = f.read()
+    return sheets, os.path.basename(path), raw_bytes
 
 
 # Shorter TTL than the rest (600s) since the underlying live alarm feed
@@ -1412,15 +1473,27 @@ elif section == "📞 User Complaint":
                 else:
                     st.dataframe(analysis['interference'], width='stretch', hide_index=True)
 
-            report_bytes = complaint_analyzer.generate_complaint_word_report(
-                rg, st.session_state['cpl_complainant'], mode, analysis)
-            st.download_button(
-                "📄 Generate complaint report (Word)", data=report_bytes,
-                file_name=f"Complaint_Report_{st.session_state['cpl_complainant']['Name'] or 'unnamed'}_"
-                          f"{st.session_state['cpl_complainant']['Date']}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="cpl_word_dl",
-            )
+            cpl_file_stub = (f"Complaint_Report_{st.session_state['cpl_complainant']['Name'] or 'unnamed'}_"
+                              f"{st.session_state['cpl_complainant']['Date']}")
+            dl_cols = st.columns(2)
+            with dl_cols[0]:
+                report_bytes = complaint_analyzer.generate_complaint_word_report(
+                    rg, st.session_state['cpl_complainant'], mode, analysis)
+                st.download_button(
+                    "📄 Generate complaint report (Word)", data=report_bytes,
+                    file_name=f"{cpl_file_stub}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="cpl_word_dl",
+                )
+            with dl_cols[1]:
+                excel_bytes = complaint_analyzer.generate_complaint_excel_report(
+                    rg, st.session_state['cpl_complainant'], mode, analysis)
+                st.download_button(
+                    "📊 Generate complaint report (Excel)", data=excel_bytes,
+                    file_name=f"{cpl_file_stub}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="cpl_excel_dl",
+                )
 
 # ============================================================
 # 🔎 INVESTIGATE — Cell Explorer, Special Reports
@@ -1649,7 +1722,10 @@ elif section == "🔎 Investigate":
 # time as they come up.
 # ============================================================
 elif section == "📋 HQ Reports":
-    sec_tabs = st.tabs(["📄 NQ Data Collection Template", "🌐 Traffic & Availability (Tripoli HQ)"])
+    sec_tabs = st.tabs([
+        "📄 NQ Data Collection Template", "🌐 Traffic & Availability (Tripoli HQ)",
+        "📶 Monthly Cell Info Report", "📈 PS Traffic per site",
+    ])
 
     with sec_tabs[0]:
         st.caption("EAST branch only, built from output/csv/ history. Not included yet: "
@@ -1761,6 +1837,80 @@ elif section == "📋 HQ Reports":
                 )
         st.caption("Download and send to Tripoli HQ manually.")
 
+    with sec_tabs[2]:
+        st.caption(
+            "Merged 2G/3G/4G cell inventory (site, cell, CI/LAC, band, traffic, lat/long, "
+            "azimuth, GCI/eGCI) pulled monthly via FTPS by the sibling cell_info_report.py "
+            f"puller. Read directly from {CELL_INFO_OUTPUT_DIR}."
+        )
+
+        months = cached_cell_info_months()
+        if not months:
+            st.info(
+                "No monthly Cell Info output found yet. Run the sibling project's "
+                "cell_info_report.py to pull and build the first month's merged file."
+            )
+        else:
+            sel_ci_month = st.selectbox("Month", months, index=0)
+            ci_df, ci_filename, ci_bytes = cached_cell_info_report(sel_ci_month)
+            if ci_df is None:
+                st.warning(f"No merged_df_*.xlsx found under {sel_ci_month}/ yet.")
+            else:
+                tech_options = sorted(ci_df['Network Type'].dropna().unique().tolist()) \
+                    if 'Network Type' in ci_df.columns else []
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Total cells", f"{len(ci_df):,}")
+                for col, tech in zip((mc2, mc3, mc4), tech_options[:3]):
+                    col.metric(f"{tech} cells", f"{(ci_df['Network Type'] == tech).sum():,}")
+
+                sel_techs = st.multiselect("Filter by Network Type", tech_options, default=tech_options)
+                filtered_ci = ci_df[ci_df['Network Type'].isin(sel_techs)] if tech_options else ci_df
+                st.dataframe(filtered_ci, width='stretch', hide_index=True)
+                st.caption(f"{len(filtered_ci)} of {len(ci_df)} row(s) shown — source file: {ci_filename}")
+
+                st.download_button(
+                    "⬇️ Download Monthly Cell Info Report (.xlsx)", data=ci_bytes,
+                    file_name=ci_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+    with sec_tabs[3]:
+        st.caption(
+            "Daily PS (data) traffic per site across 2G/3G/4G, pulled and combined by the "
+            f"sibling \"PS Traffic per site\" puller. Read directly from {PS_TRAFFIC_OUTPUT_DIR}."
+        )
+
+        ps_sheets, ps_filename, ps_bytes = cached_ps_traffic_report()
+        if ps_sheets is None:
+            st.info(
+                "No combined PS Traffic report found yet. Run the sibling project's "
+                "\"PS Traffic per site v3.py\" puller to build it."
+            )
+        else:
+            st.caption(f"Source file: {ps_filename}")
+            ps_sheet_tabs = st.tabs(list(ps_sheets.keys()))
+            for ps_tab, (ps_sheet_name, ps_df) in zip(ps_sheet_tabs, ps_sheets.items()):
+                with ps_tab:
+                    if ps_sheet_name == "All_Traffic_Data" and "Site_Name" in ps_df.columns:
+                        site_query = st.text_input(
+                            "Filter by site name (contains)", key="ps_traffic_site_filter"
+                        )
+                        shown = (
+                            ps_df[ps_df['Site_Name'].str.contains(site_query, case=False, na=False)]
+                            if site_query else ps_df
+                        )
+                    else:
+                        shown = ps_df
+                    st.dataframe(shown, width='stretch', hide_index=True)
+                    st.caption(f"{len(shown)} row(s)")
+
+            st.divider()
+            st.download_button(
+                "⬇️ Download PS Traffic per site Report (.xlsx)", data=ps_bytes,
+                file_name=ps_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
 # ============================================================
 # 📧 REPORTS — network summary + copy-paste text + Word/Excel export
 # ============================================================
@@ -1802,13 +1952,3 @@ elif section == "📧 Reports":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     width='stretch',
                 )
-
-        st.divider()
-        st.subheader("✉️ Copy-Paste Text")
-        st.caption("Identical content to the automated daily report — select all and copy into an email.")
-        email_text = rg.generate_email_text(
-            target_date, previous_date, health, bundle['scorecards'], bundle['worst_cells'],
-            bundle['site_health'], bundle['topology'], bundle['traffic'],
-            bundle['site_inventory'], bundle['freshness'], bundle['trend'], bundle['alarm_report'],
-        )
-        st.text_area("Report text", email_text, height=500)
