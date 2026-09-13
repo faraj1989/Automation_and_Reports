@@ -9,11 +9,13 @@ Platform roadmap):
   1.  Executive Summary
   2.  Technology Scorecards (2G/3G/4G, busy-hour KPIs vs threshold)
   3.  Worst Cells (Top 10, combined across technologies)
-  4.  Site Health & Topology Impact (basic — per-tech availability proxy;
-      real alarm-to-topology correlation is Phase 3/4, once NetEco is wired
-      in. The FN/HUB/Site reference table is already loaded and reported on
-      so Phase 4 has something to correlate against.)
-  5.  Alarms Summary — placeholder (Phase 3, pending NetEco integration)
+  4.  Site Health & Topology Impact (per-tech availability proxy, plus
+      FN/HUB/Site reference table for shared-infrastructure correlation)
+  5.  Alarms Summary — live site alarm status + historical chronic-offender/
+      downtime rollups, read from a sibling NOC Automation Suite's MAE/
+      NetEco/NCE alarm pipeline (see backend/noc_alarm_processor.py). That
+      feed is optional and independently timestamped; a missing or stale
+      alarm source degrades to an empty section, not an error.
   6.  ISP & External Traffic — placeholder (Phase 5, pending ISP feed)
   7.  Traffic & Capacity (daily traffic volumes)
   8.  Site Inventory & Availability (multi-RAT site composition)
@@ -45,6 +47,9 @@ matplotlib.use('Agg')  # headless - this runs server-side, no display available
 import matplotlib.pyplot as plt
 
 from backend.health_checker import HealthChecker
+from backend import noc_alarm_processor as noc_alarms
+from backend import smartcare_cem_processor as cem
+from backend import device_penetration_processor as device_penetration
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,12 @@ TRAFFIC_SPECS = [
         ('DL Traffic (GB)', 'DL Traffic  Volume(GB)'),
         ('UL Traffic (GB)', 'UL Traffic  Volume(GB)'),
         ('VoLTE Traffic (Erl)', 'VoLTE Traffic Volume (Erl)'),
+    ]),
+    ('Core (Gi/Sgi)', 'Gi_Interface_Traffic', [
+        ('PS Core Gi Traffic 2G/3G (TB)', 'PS core_Gi _23G traffic (TB)'),
+        ('PS Sgi Traffic 4G (TB)', 'PS 4G Sgi_traffic (TB)'),
+        ('PS Core Traffic 2G/3G/4G (TB)', 'PS 234G traffic (TB)'),
+        ('PGW-C VoLTE IMS Subscribers', 'PGW-C current VoLTE IMS subscribers(number)'),
     ]),
 ]
 
@@ -157,6 +168,7 @@ FRESHNESS_FILES = {
     '3G_NWBH': 'Date', '3G_NW_Daily': 'Date', '3G_Cell_CSBH': 'Date',
     '4G_NWBH': 'Date', '4G_NW_Daily': 'Date', '4G_Cell_BH': 'Date',
     'Traffic_Network_2G': 'Date', 'Traffic_Network_3G': 'Date', 'Traffic_Network_4G': 'Date',
+    'Gi_Interface_Traffic': 'Date',
 }
 
 CELL_SHEETS = {'GSM': '2G_Cell_CSBH', 'UMTS': '3G_Cell_CSBH', 'LTE': '4G_Cell_BH'}
@@ -462,8 +474,9 @@ class ReportGenerator:
 
     def build_topology_summary(self) -> Dict:
         """Section 4 support: readiness stats for the FN/HUB→Site reference
-        table. No alarm feed exists yet, so this can only report that the
-        topology is loaded and ready — real impact analysis is Phase 4."""
+        table. Real-time alarm correlation against this table happens per
+        selected site via get_site_alarm_status() + get_site_topology(),
+        not as a standing network-wide join here."""
         if not os.path.exists(TOPOLOGY_FILE):
             return {'loaded': False}
         try:
@@ -481,6 +494,170 @@ class ReportGenerator:
             'site_relationships': len(df),
             'regions': sorted(df['Region'].dropna().unique().tolist()),
         }
+
+    def get_site_topology(self, site_names: List[str]) -> pd.DataFrame:
+        """For each given site, which FN/HUB node it hangs off and which
+        OTHER sites share that same node - i.e. "if this node's link goes
+        down, what else goes down with it." A site can appear as a
+        Connected_Site under more than one node (rare but real - e.g. a
+        HUB site that's itself relayed by another FN); every match is
+        returned. Site names not found in the topology reference are
+        simply absent from the result (not an error - many sites have no
+        FN/HUB dependency)."""
+        if not os.path.exists(TOPOLOGY_FILE) or not site_names:
+            return pd.DataFrame()
+        try:
+            df = pd.read_csv(TOPOLOGY_FILE)
+        except Exception as e:
+            logger.warning(f"Could not read {TOPOLOGY_FILE}: {e}")
+            return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
+
+        rows = []
+        for _, node_group in df.groupby('Node_Name'):
+            siblings = node_group['Connected_Site'].tolist()
+            matches = node_group[node_group['Connected_Site'].isin(site_names)]
+            for _, m in matches.iterrows():
+                other_sites = [s for s in siblings if s != m['Connected_Site']]
+                rows.append({
+                    'Site Name': m['Connected_Site'],
+                    'FN/HUB Node': m['Node_Name'],
+                    'Node Type': m['Node_Type'],
+                    'Region': m['Region'],
+                    'Sites Sharing This Node': len(other_sites),
+                    'Other Sites on Same Node': ', '.join(other_sites[:15]) + (f" +{len(other_sites) - 15} more" if len(other_sites) > 15 else ''),
+                })
+        return pd.DataFrame(rows)
+
+    def build_alarm_overview(self) -> Dict:
+        """Network-wide NOC alarm view for the Alarms section: live
+        currently-down sites plus historical chronic-offender/downtime/
+        trend rollups, both computed natively from this project's own raw
+        MAE/NetEco/NCE exports (backend/noc_alarm_processor.py) - no
+        dependency on any process outside this project. Each half is
+        independently optional/timestamped - see that module's docstring."""
+        return {
+            'live': noc_alarms.build_live_disconnected_sites(),
+            'historical': noc_alarms.build_historical_insights_native(),
+        }
+
+    def get_site_alarm_status(self, site_names: List[str]) -> Dict:
+        """Per-site alarm view for the Investigate tabs: any active
+        disconnect/power alarm right now, plus historical chronic-offender/
+        downtime rows for the given site(s) - the alarm-side counterpart to
+        get_site_topology() above, so a site under investigation shows both
+        "what shares its transmission node" and "is it actually alarmed."""
+        return noc_alarms.get_site_alarm_status(site_names)
+
+    def build_daily_noc_alarm_report(self, target_date: str) -> Dict:
+        """Section 5 (Alarms Summary) support: for target_date specifically
+        (not "right now"), how many sites went down, total summed downtime
+        hours, and per-down-site NetEco (power) + NCE (transmission) reason
+        evidence merged into one row - read from the sibling suite's raw
+        historical alarm exports, independent of its own (currently
+        overloaded) ledger pipeline. See backend/noc_alarm_processor.py."""
+        return noc_alarms.build_daily_noc_alarm_report(target_date)
+
+    def build_cem_overview(self) -> Dict:
+        """Subscriber-experience view (SmartCare CEM: application traffic
+        mix + TCP-level connection quality trend), read read-only from the
+        sibling suite's weekly SmartCare export/analysis pipeline.
+        Network-wide, no per-site breakdown - see
+        backend/smartcare_cem_processor.py."""
+        return cem.load_cem_overview()
+
+    def build_device_penetration_overview(self) -> Dict:
+        """Network-wide device model/brand/OS/technology mix from the
+        sibling suite's weekly Device Penetration export (same SmartCare
+        portal as CEM, different dashboard) - read read-only, see
+        backend/device_penetration_processor.py."""
+        return device_penetration.load_device_penetration_overview()
+
+    def build_site_detail_summary(self) -> Dict:
+        """Network-wide rollup of SiteDetail.csv for the Sites &
+        Infrastructure tab's Site Detail view: RAT-combo distribution,
+        Scenario distribution, and how many sites currently run only ONE
+        active 4G carrier (the same "free band slot" signal
+        build_site_capacity_advice uses per-site, here summarized across
+        the whole network so it reads as a planning overview rather than a
+        per-site alert)."""
+        site_detail = self._load_csv('SiteDetail')
+        if site_detail is None or site_detail.empty:
+            return {'loaded': False}
+
+        rat_counts = site_detail['RAT'].value_counts().to_dict() if 'RAT' in site_detail.columns else {}
+        scenario_counts = site_detail['Scenario'].value_counts().to_dict() if 'Scenario' in site_detail.columns else {}
+
+        band_cols = self._4G_BAND_COLS
+        present = [c for c in band_cols if c in site_detail.columns]
+        active_band_count = site_detail[present].notna().sum(axis=1) if present else pd.Series(dtype=int)
+        single_carrier_sites = int((active_band_count == 1).sum()) if len(active_band_count) else 0
+        multi_carrier_sites = int((active_band_count >= 2).sum()) if len(active_band_count) else 0
+        no_lte_sites = int((active_band_count == 0).sum()) if len(active_band_count) else 0
+
+        band_adoption = {
+            c.replace('4G ', '').replace(' Band', ''): int(site_detail[c].notna().sum())
+            for c in present
+        }
+
+        return {
+            'loaded': True,
+            'total_sites': len(site_detail),
+            'rat_counts': rat_counts,
+            'scenario_counts': scenario_counts,
+            'single_carrier_lte_sites': single_carrier_sites,
+            'multi_carrier_lte_sites': multi_carrier_sites,
+            'no_lte_sites': no_lte_sites,
+            'band_adoption': band_adoption,
+        }
+
+    # No config/kpi_thresholds.csv entry exists for backhaul ping packet
+    # loss specifically (only LTE user-plane packet loss, a different
+    # metric, at 0.5%) - this is a transport/backhaul-link quality bar,
+    # not a source-of-truth threshold, kept as a named constant so it's
+    # easy to tune rather than buried in the aggregation logic below.
+    PACKET_LOSS_ELEVATED_PCT = 0.1
+
+    def build_packet_loss_report(self, period: str, target_date: str) -> pd.DataFrame:
+        """Transmission_KPIs.csv (IUB/ABIS ping packet loss/delay, one row
+        per adjacency per day) rolled up over `period` ('day'/'week'/
+        'month' - week = trailing 7 days, month = trailing 30 days, both
+        ending at target_date) and ranked by Avg Packet Loss(%) descending,
+        per your ask. One row per (Site Name, Adjacent Node Name)."""
+        df = self._load_csv('Transmission_KPIs')
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.copy()
+        df['_date'] = pd.to_datetime(df['Date'], errors='coerce')
+        end = pd.to_datetime(self.health_checker.normalize_date(target_date))
+        if pd.isna(end):
+            return pd.DataFrame()
+        span_days = {'day': 1, 'week': 7, 'month': 30}.get(period, 1)
+        start = end - pd.Timedelta(days=span_days - 1)
+        window = df[(df['_date'] >= start) & (df['_date'] <= end)]
+        if window.empty:
+            return pd.DataFrame()
+
+        group_cols = [c for c in ['Site Name', 'Adjacent Node Name', 'Adjacent Node Type', 'GBSC'] if c in window.columns]
+        if not group_cols:
+            return pd.DataFrame()
+
+        agg = window.groupby(group_cols, dropna=False).agg(
+            **{
+                'Avg Packet Loss(%)': ('Avg Packet Loss(%)', 'mean'),
+                'Max Packet Loss(%)': ('Max Packet Loss(%)', 'max'),
+                'Avg Delay(ms)': ('Avg Delay(ms)', 'mean'),
+                'Max Delay(ms)': ('Max Delay(ms)', 'max'),
+                'Days Reporting': ('_date', 'nunique'),
+            }
+        ).reset_index()
+
+        for col in ['Avg Packet Loss(%)', 'Max Packet Loss(%)', 'Avg Delay(ms)', 'Max Delay(ms)']:
+            agg[col] = agg[col].round(4)
+
+        return agg.sort_values('Avg Packet Loss(%)', ascending=False, na_position='last').reset_index(drop=True)
 
     def build_site_inventory(self, target_date: str) -> pd.DataFrame:
         """Section 8: multi-RAT site composition (from SiteSummary.csv)."""
@@ -782,7 +959,13 @@ class ReportGenerator:
 
         target_norm = self.health_checker.normalize_date(target_date)
         df = df.copy()
-        df['_norm_date'] = df['Date'].apply(self.health_checker.normalize_date)
+        # Vectorized over the whole column - .apply(normalize_date) here
+        # calls pd.to_datetime() once per scalar, which measured at
+        # 55-95s on this project's 125k-213k row cell sheets (pandas'
+        # datetime parser is built for whole-array input, not repeated
+        # scalar calls); this one-line change was the actual bottleneck
+        # behind Cell Explorer/Special Reports feeling slow on selection.
+        df['_norm_date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
         today = df[(df['_norm_date'] == target_norm) & (df[cell_col].isin(cell_names))]
         if today.empty:
             return pd.DataFrame()
@@ -807,6 +990,140 @@ class ReportGenerator:
                         'Threshold': f"{r['Operator']} {r['Threshold']}",
                         'Suggested Fix': self._suggest_action(r['KPI_Name']),
                     })
+        return pd.DataFrame(rows)
+
+    # Column -> short label for the 4G carrier-slot columns in SiteDetail.csv,
+    # used to name which slot is still free when suggesting "activate
+    # another band" (SITE_DETAIL_HEADER in site_detail_processor.py).
+    _4G_BAND_COLS = ['4G L1800 F1 Band', '4G L1800 F2 Band', '4G L2100 Band', '4G L900 Band', '4G L700 Band']
+    _2G_BAND_COLS = ['2G GSM900 Band', '2G DCS1800 Band']
+    _3G_BAND_COLS = ['3G U2100 Band', '3G U900 Band']
+
+    def build_site_capacity_advice(self, site_names: List[str], target_date: str) -> pd.DataFrame:
+        """Site-level capacity advice, combining SiteDetail.csv's band/
+        scenario config with today's PRB/Congestion KPIs across all 3
+        technologies - unlike get_cell_failing_kpis's generic per-KPI
+        "Evaluate cell for capacity expansion" text, this names the
+        SPECIFIC lever available at the site: an inactive 4G band slot to
+        activate if only one carrier is up, vs. a sector/cabinet upgrade
+        if every configured carrier is already active and still congested.
+
+        Thresholds/operators come from config/kpi_thresholds.csv via
+        self.health_checker (same source of truth as the rest of the
+        report), not hardcoded here - only the "what to say about it"
+        phrasing is new. One row per (site, failing KPI); a site with
+        nothing failing gets a single "no concerns" row so the caller
+        always has something to display.
+
+        Each of the 3 cell sheets is loaded and filtered to target_date
+        exactly ONCE up front (not once per site) - these are the same
+        multi-ten-MB busy-hour sheets used everywhere else in this class,
+        and looping resolve_group_to_cells()/_load_csv() per site (each of
+        which re-reads its CSV from scratch) made this take well over a
+        minute for a handful of sites when first tested."""
+        thresholds = self.health_checker.thresholds
+        if not site_names or thresholds is None:
+            return pd.DataFrame()
+
+        site_detail = self._load_csv('SiteDetail')
+        site_detail_by_name = {}
+        if site_detail is not None and 'Site Name' in site_detail.columns:
+            site_detail_by_name = site_detail.set_index('Site Name').to_dict('index')
+
+        capacity_thresholds = thresholds[thresholds['KPI_Name'].str.contains('PRB|Congestion', case=False, na=False)]
+        target_norm = self.health_checker.normalize_date(target_date)
+
+        # Pre-load and pre-filter each tech's busy-hour sheet to target_date
+        # once, keyed by site_col value, so the per-site loop below is pure
+        # in-memory filtering on an already-small (one day's) frame.
+        today_by_tech = {}
+        for tech, sheet in [('LTE', CELL_SHEETS['LTE']), ('GSM', CELL_SHEETS['GSM']), ('UMTS', CELL_SHEETS['UMTS'])]:
+            df = self._load_csv(sheet)
+            if df is None:
+                continue
+            df = df.copy()
+            df['_norm_date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            today_by_tech[tech] = df[df['_norm_date'] == target_norm]
+
+        rows = []
+        for site in site_names:
+            detail = site_detail_by_name.get(site, {})
+            findings = []
+
+            for tech, sheet, band_cols in [
+                ('LTE', CELL_SHEETS['LTE'], self._4G_BAND_COLS),
+                ('GSM', CELL_SHEETS['GSM'], self._2G_BAND_COLS),
+                ('UMTS', CELL_SHEETS['UMTS'], self._3G_BAND_COLS),
+            ]:
+                today_tech = today_by_tech.get(tech)
+                if today_tech is None or today_tech.empty:
+                    continue
+                site_col = SITE_COL_BY_TECH[tech]
+                if site_col not in today_tech.columns:
+                    continue
+                today = today_tech[today_tech[site_col] == site]
+                if today.empty:
+                    continue
+
+                tech_capacity = capacity_thresholds[
+                    (capacity_thresholds['Technology'] == tech) &
+                    (capacity_thresholds['Source_Sheet'].str.contains(sheet, na=False))
+                ]
+                for _, r in tech_capacity.iterrows():
+                    col = r['Column_Name']
+                    if col not in today.columns:
+                        continue
+                    avg_val = pd.to_numeric(today[col], errors='coerce').mean()
+                    if pd.isna(avg_val):
+                        continue
+                    passed, _ = self.health_checker.check_kpi(avg_val, r['Threshold'], r['Operator'])
+                    if passed:
+                        continue
+
+                    if tech == 'LTE':
+                        # pd.notna guards against blank SiteDetail cells, which
+                        # load as float NaN - str(nan) is the non-empty string
+                        # "nan", so a plain str().strip() truthiness check
+                        # misreads every blank band slot as filled.
+                        active = [c for c in band_cols if pd.notna(detail.get(c)) and str(detail.get(c)).strip()]
+                        free = [c.replace('4G ', '').replace(' Band', '') for c in band_cols
+                                if not (pd.notna(detail.get(c)) and str(detail.get(c)).strip())]
+                        if free:
+                            advice = (f"Congested with {len(active)} of {len(band_cols)} LTE carrier slot(s) "
+                                      f"active. Site config has a free slot for {', '.join(free)} - activating "
+                                      f"it would add capacity without a hardware change, before considering a "
+                                      f"sector/cabinet upgrade.")
+                        else:
+                            active_labels = [c.replace('4G ', '').replace(' Band', '') for c in active]
+                            advice = (f"Congested despite {len(active)} active LTE carrier(s) "
+                                      f"({', '.join(active_labels) or 'unknown'}). No free band slot in config - "
+                                      f"consider a sector/cabinet upgrade beyond the current Scenario "
+                                      f"('{detail.get('Scenario', 'unknown')}') or spectrum refarming.")
+                    elif tech == 'GSM':
+                        rat = detail.get('RAT', '')
+                        if 'U' in str(rat) or 'L' in str(rat):
+                            advice = (f"2G congestion on a site that also has {rat.replace('G', '')} coverage - "
+                                      f"consider steering traffic to 3G/4G (layer balancing) before adding 2G TRX "
+                                      f"hardware.")
+                        else:
+                            advice = "2G congestion on a 2G-only site - evaluate adding TRX capacity."
+                    else:
+                        advice = f"{r['KPI_Name']} is breaching threshold - evaluate for capacity expansion."
+
+                    findings.append({
+                        'Technology': tech, 'KPI': r['KPI_Name'], 'Value': round(float(avg_val), 2),
+                        'Threshold': f"{r['Operator']} {r['Threshold']}", 'Recommendation': advice,
+                    })
+
+            if findings:
+                for f in findings:
+                    rows.append({'Site Name': site, **f})
+            else:
+                rows.append({
+                    'Site Name': site, 'Technology': '', 'KPI': '', 'Value': None, 'Threshold': '',
+                    'Recommendation': 'No capacity concerns detected for this site based on current thresholds.',
+                })
+
         return pd.DataFrame(rows)
 
     def build_executive_summary(self, health: Dict, worst_cells: Dict[str, pd.DataFrame],
@@ -866,7 +1183,7 @@ class ReportGenerator:
                              worst_cells: Dict[str, pd.DataFrame], site_health: pd.DataFrame,
                              topology: Dict, traffic: pd.DataFrame,
                              site_inventory: pd.DataFrame, freshness: pd.DataFrame,
-                             trend: Dict[str, pd.DataFrame]) -> str:
+                             trend: Dict[str, pd.DataFrame], alarm_report: Optional[Dict] = None) -> str:
         lines = []
         lines.append("=" * 78)
         lines.append(f"📊 LIBYANA NETWORK PERFORMANCE REPORT - {target_date}")
@@ -919,13 +1236,24 @@ class ReportGenerator:
                           f"regions: {', '.join(topology['regions'])}.")
         else:
             lines.append(f"  Topology reference not found ({TOPOLOGY_FILE}).")
-        lines.append("  Alarm-to-topology impact correlation (\"FN X down -> N sites affected\") "
-                      "is Phase 3/4, pending NetEco integration.")
+        lines.append("  Alarm-to-topology impact correlation (\"FN X down -> N sites affected\") is "
+                      "available per site via get_site_topology() + get_site_alarm_status() in the "
+                      "dashboard's Investigate tabs, not as a standing network-wide join here.")
         lines.append("")
 
         lines.append("5. ALARMS SUMMARY")
         lines.append("-" * 78)
-        lines.append("  ⏳ Not yet available — pending Huawei NetEco alarm feed integration (Phase 3).")
+        if not alarm_report or not alarm_report.get('available'):
+            lines.append("  ⏳ Not available for this date — NOC alarm feed not found, or the raw "
+                          "historical export has aged out of the sibling suite's retention window.")
+        else:
+            lines.append(f"  Sites down on {target_date}: {alarm_report['sites_down']}  |  "
+                          f"Total downtime: {alarm_report['total_down_hours']:.1f} hours")
+            lines.append("")
+            lines.append("  Down Sites (NetEco power / NCE transmission evidence merged):")
+            lines.append(self._render_table(alarm_report['down_sites_summary'].head(20)))
+            if len(alarm_report['down_sites_summary']) > 20:
+                lines.append(f"  ... and {len(alarm_report['down_sites_summary']) - 20} more site(s)")
         lines.append("")
 
         lines.append("6. ISP & EXTERNAL TRAFFIC")
@@ -941,7 +1269,7 @@ class ReportGenerator:
         lines.append("8. SITE INVENTORY & AVAILABILITY")
         lines.append("-" * 78)
         lines.append(self._render_table(site_inventory))
-        lines.append("  Site outages: pending NetEco alarm integration (Phase 3).")
+        lines.append("  Site outages: see section 5, Alarms Summary.")
         lines.append("")
 
         lines.append("9. DATA FRESHNESS")
@@ -974,7 +1302,7 @@ class ReportGenerator:
                                scorecards: Dict[str, pd.DataFrame], worst_cells: Dict[str, pd.DataFrame],
                                site_health: pd.DataFrame, topology: Dict, traffic: pd.DataFrame,
                                site_inventory: pd.DataFrame, freshness: pd.DataFrame,
-                               trend: Dict[str, pd.DataFrame]) -> str:
+                               trend: Dict[str, pd.DataFrame], alarm_report: Optional[Dict] = None) -> str:
         filename = f"Network_Report_{target_date}.xlsx"
         filepath = os.path.join(self.output_folder, filename)
 
@@ -1004,8 +1332,7 @@ class ReportGenerator:
                 site_health.to_excel(writer, sheet_name='Site_Health', index=False)
 
             topology_note = pd.DataFrame([{
-                'Status': 'Reference loaded, not yet correlated to alarms (Phase 3/4)' if topology.get('loaded')
-                          else 'Topology file not found',
+                'Status': 'Reference loaded' if topology.get('loaded') else 'Topology file not found',
                 'Nodes': topology.get('nodes'),
                 'Fiber Nodes (FN)': topology.get('fn_count'),
                 'Hubs': topology.get('hub_count'),
@@ -1016,8 +1343,24 @@ class ReportGenerator:
             if os.path.exists(TOPOLOGY_FILE):
                 pd.read_csv(TOPOLOGY_FILE).to_excel(writer, sheet_name='Topology_Detail', index=False)
 
-            pd.DataFrame([{'Status': 'Not yet available — pending Huawei NetEco alarm feed integration (Phase 3)'}]
-                         ).to_excel(writer, sheet_name='Alarms_Summary', index=False)
+            if not alarm_report or not alarm_report.get('available'):
+                pd.DataFrame([{'Status': 'Not available for this date — NOC alarm feed not found, or the raw '
+                                          'historical export has aged out of the sibling suite\'s retention window'}]
+                             ).to_excel(writer, sheet_name='Alarms_Summary', index=False)
+            else:
+                pd.DataFrame([{
+                    'Date': target_date, 'Sites Down': alarm_report['sites_down'],
+                    'Total Downtime (Hours)': round(alarm_report['total_down_hours'], 2),
+                }]).to_excel(writer, sheet_name='Alarms_Summary', index=False)
+                down_summary = alarm_report['down_sites_summary']
+                if not down_summary.empty:
+                    down_summary.to_excel(writer, sheet_name='Down_Sites_Detail', index=False)
+                neteco_alarms = alarm_report.get('neteco_alarms')
+                if neteco_alarms is not None and not neteco_alarms.empty:
+                    neteco_alarms.to_excel(writer, sheet_name='NetEco_Alarms', index=False)
+                nce_alarms = alarm_report.get('nce_alarms')
+                if nce_alarms is not None and not nce_alarms.empty:
+                    nce_alarms.to_excel(writer, sheet_name='NCE_Alarms', index=False)
             pd.DataFrame([{'Status': 'Not yet available — pending ISP peering/backbone traffic feed integration (Phase 5)'}]
                          ).to_excel(writer, sheet_name='ISP_Traffic', index=False)
 
@@ -1195,7 +1538,7 @@ class ReportGenerator:
                               worst_cells: Dict[str, pd.DataFrame], site_health: pd.DataFrame,
                               topology: Dict, traffic: pd.DataFrame,
                               site_inventory: pd.DataFrame, freshness: pd.DataFrame,
-                              trend: Dict[str, pd.DataFrame]) -> str:
+                              trend: Dict[str, pd.DataFrame], alarm_report: Optional[Dict] = None) -> str:
         doc = Document()
         for style_name in ('Normal',):
             style = doc.styles[style_name]
@@ -1268,15 +1611,28 @@ class ReportGenerator:
         else:
             doc.add_paragraph(f"Topology reference not found ({TOPOLOGY_FILE}).")
         note = doc.add_paragraph(
-            'Alarm-to-topology impact correlation ("FN X down -> N sites affected") '
-            'is Phase 3/4, pending NetEco integration.'
+            'Alarm-to-topology impact correlation ("FN X down -> N sites affected") is available per '
+            'site via the dashboard\'s Investigate tabs, not as a standing network-wide join here.'
         )
         note.runs[0].italic = True
 
         # 5. Alarms Summary
         self._docx_section_heading(doc, '5. Alarms Summary')
-        p = doc.add_paragraph('⏳ Not yet available — pending Huawei NetEco alarm feed integration (Phase 3).')
-        p.runs[0].italic = True
+        if not alarm_report or not alarm_report.get('available'):
+            p = doc.add_paragraph('⏳ Not available for this date — NOC alarm feed not found, or the raw '
+                                   'historical export has aged out of the sibling suite\'s retention window.')
+            p.runs[0].italic = True
+        else:
+            doc.add_paragraph(
+                f"Sites down on {target_date}: {alarm_report['sites_down']}  |  "
+                f"Total downtime: {alarm_report['total_down_hours']:.1f} hours"
+            )
+            doc.add_heading('Down Sites (NetEco power / NCE transmission evidence merged)', level=2)
+            down_summary = alarm_report['down_sites_summary']
+            self._docx_add_table(doc, down_summary.head(20) if not down_summary.empty else down_summary)
+            if len(down_summary) > 20:
+                doc.add_paragraph(f"... and {len(down_summary) - 20} more site(s) — see the Excel report "
+                                   f"(Down_Sites_Detail sheet) for the full list.")
 
         # 6. ISP & External Traffic
         self._docx_section_heading(doc, '6. ISP & External Traffic')
@@ -1290,7 +1646,7 @@ class ReportGenerator:
         # 8. Site Inventory & Availability
         self._docx_section_heading(doc, '8. Site Inventory & Availability')
         self._docx_add_table(doc, site_inventory)
-        p = doc.add_paragraph('Site outages: pending NetEco alarm integration (Phase 3).')
+        p = doc.add_paragraph('Site outages: see section 5, Alarms Summary.')
         p.runs[0].italic = True
 
         # 9. Data Freshness
@@ -1366,6 +1722,42 @@ class ReportGenerator:
 
         buf = io.BytesIO()
         doc.save(buf)
+        buf.seek(0)
+        return buf.read()
+
+    def generate_tables_excel_report(self, title: str, tables: List[Tuple[str, Optional[pd.DataFrame]]],
+                                      subtitle: str = "") -> bytes:
+        """Lightweight standalone Excel export for a single dashboard tab/view -
+        one sheet per named table, no charts. Same use case as
+        generate_tables_word_report (per-tab exports where the full daily
+        report would be overkill), just as .xlsx for teams that want to
+        filter/pivot the numbers rather than read a document."""
+        seen_names: Dict[str, int] = {}
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            info_rows = [['Report', title]]
+            if subtitle:
+                info_rows.append(['Scope', subtitle])
+            info_rows.append(['Generated', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            pd.DataFrame(info_rows, columns=['Field', 'Value']).to_excel(
+                writer, sheet_name='Info', index=False)
+
+            wrote_any = False
+            for name, df in tables:
+                if df is None or df.empty:
+                    continue
+                # Excel sheet names: 31 chars max, no \ / * ? : [ ]
+                safe_name = re.sub(r'[\\/*?:\[\]]', '_', str(name))[:31]
+                count = seen_names.get(safe_name, 0)
+                seen_names[safe_name] = count + 1
+                if count:
+                    safe_name = f"{safe_name[:28]}_{count}"
+                df.to_excel(writer, sheet_name=safe_name or 'Sheet1', index=False)
+                wrote_any = True
+            if not wrote_any:
+                pd.DataFrame([{'Status': 'No data available'}]).to_excel(
+                    writer, sheet_name='Sheet1', index=False)
+            autofit_excel_columns(writer)
         buf.seek(0)
         return buf.read()
 
@@ -1452,10 +1844,11 @@ class ReportGenerator:
         site_inventory = self.build_site_inventory(target_date)
         freshness = self.build_data_freshness(target_date)
         trend = self.build_trend(target_date, days=14)
+        alarm_report = self.build_daily_noc_alarm_report(target_date)
 
         email_text = self.generate_email_text(
             target_date, previous_date, health, scorecards, worst_cells, site_health,
-            topology, traffic, site_inventory, freshness, trend
+            topology, traffic, site_inventory, freshness, trend, alarm_report
         )
         text_file = os.path.join(self.output_folder, f"Network_Report_{target_date}.txt")
         with open(text_file, 'w', encoding='utf-8') as f:
@@ -1463,12 +1856,12 @@ class ReportGenerator:
 
         excel_file = self.generate_excel_report(
             target_date, health, scorecards, worst_cells, site_health, topology,
-            traffic, site_inventory, freshness, trend
+            traffic, site_inventory, freshness, trend, alarm_report
         )
 
         word_file = self.generate_word_report(
             target_date, previous_date, health, scorecards, worst_cells, site_health,
-            topology, traffic, site_inventory, freshness, trend
+            topology, traffic, site_inventory, freshness, trend, alarm_report
         )
 
         return text_file, excel_file, word_file

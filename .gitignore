@@ -18,3 +18,5 @@ venv/
 # Credentials - never commit
 ftp_config.json
 ftp_config.jason
+.env
+logs/login_failures/

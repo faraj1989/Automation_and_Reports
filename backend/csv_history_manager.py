@@ -414,15 +414,27 @@ class CSVHistoryManager:
         trimmed for a long time - full retention is what the monthly (and
         longer) HQ interference criteria need. Same vectorized
         concat+drop_duplicates approach as update_hourly_cell_kpis since
-        this is also millions-of-rows-scale for 3G/4G."""
+        this is also millions-of-rows-scale for 3G/4G.
+
+        Also maintains the small 3G_Interference_Daily/4G_Interference_Daily
+        rollups (backend.interference_processor.update_daily_rollup) from
+        just this batch, so build_external_interference_report never has to
+        read the multi-hundred-MB raw archives - those grew large enough
+        (500-700MB+) to make pd.read_csv() raise MemoryError on this
+        machine, both interactively and (worse) inside this very method's
+        own raw-archive read/concat/write, which only gets more likely to
+        OOM as the raw files keep growing."""
         if not results_dict:
             return
+
+        from backend.interference_processor import update_daily_rollup, ROLLUP_SPECS
 
         key_cols_by_sheet = {
             '2G_Interference': ['Cell Name', 'Date'],
             '3G_Interference_Hourly': ['Cell Name', 'Time'],
             '4G_Interference_Hourly': ['Cell Name', 'Time'],
         }
+        rollup_sheet_by_raw_sheet = {spec['raw_sheet']: (tech, spec['rollup_sheet']) for tech, spec in ROLLUP_SPECS.items()}
 
         for sheet_name, df in results_dict.items():
             if df is None or df.empty:
@@ -437,6 +449,14 @@ class CSVHistoryManager:
 
             self._write_csv(sheet_name, combined)
             logger.info(f"Interference KPI {sheet_name}: {rows_before} -> {len(combined)} rows")
+            del existing, combined  # this batch's raw frames are done - release before the rollup step
+
+            if sheet_name in rollup_sheet_by_raw_sheet:
+                tech, rollup_sheet = rollup_sheet_by_raw_sheet[sheet_name]
+                existing_rollup = self._read_csv(rollup_sheet)
+                new_rollup = update_daily_rollup(df, existing_rollup, tech)
+                self._write_csv(rollup_sheet, new_rollup)
+                logger.info(f"Interference rollup {rollup_sheet}: {len(existing_rollup)} -> {len(new_rollup)} rows")
 
     def update_traffic_kpis(self, results_dict):
         """Update all traffic KPI CSVs."""
@@ -503,6 +523,24 @@ class CSVHistoryManager:
         key_cols = ['Date', 'GBSC', 'Adjacent Node Name', 'Adjacent Node Type', 'Adjacent Node ID']
         self._append_with_dup_check('Packet_Loss', df, key_cols)
         logger.info(f"Updated Packet_Loss with {len(df)} rows")
+
+    def update_noc_daily_alarm_summary(self, df):
+        """Archive one day's down-site NOC alarm analysis (backend.noc_alarm_processor.
+        build_daily_noc_alarm_report's 'down_sites_summary' - one row per site that
+        went down that day, with merged NetEco/NCE reasons). Uses keep='last' (not
+        _append_with_dup_check's skip-duplicate behavior) since a later re-run for the
+        same date reads a fresher raw export with more complete Cleared-On data and
+        should overwrite the earlier, less-complete row for that Date+Site."""
+        if df is None or df.empty:
+            return
+
+        key_cols = ['Date', 'Site']
+        existing = self._read_csv('NOC_Daily_Alarm_Summary')
+        rows_before = len(existing)
+        combined = pd.concat([existing, df], ignore_index=True) if not existing.empty else df.copy()
+        combined = combined.drop_duplicates(subset=key_cols, keep='last')
+        self._write_csv('NOC_Daily_Alarm_Summary', combined)
+        logger.info(f"NOC_Daily_Alarm_Summary: {rows_before} -> {len(combined)} rows")
 
     def update_ept_config(self, df):
         """Replace the entire EPT_Config CSV."""

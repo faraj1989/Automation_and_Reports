@@ -82,6 +82,23 @@ class SFTPDownloader:
             mtime_dt = datetime.fromtimestamp(mtime)
             result = mtime_dt.strftime('%Y-%m-%d')
             return result
+        except (FileNotFoundError, OSError) as e:
+            if getattr(e, 'errno', None) == 2 or isinstance(e, FileNotFoundError):
+                # Expected, not a fault: this filename came from a listdir()
+                # snapshot taken at the start of this pass, but several
+                # rolling reports (hourly all-cells, VoLTE, Gi Interface)
+                # get regenerated and their old copy deleted - including by
+                # our own cleanup_old_remote_duplicates() right after a
+                # fresh download - before this loop reaches every entry.
+                # The current copy still gets caught (either later in this
+                # same pass, or the next run a few hours on), so this is
+                # self-healing, not data loss - see download_and_organize's
+                # caller, which counts this as skipped, not an error.
+                self.log(f"ℹ️ {filename} no longer on server (likely rotated/cleaned up since the directory "
+                         f"listing was taken) - will pick up its replacement instead")
+            else:
+                self.log(f"⚠️ Could not get mtime for {filename}: {e}")
+            return None
         except Exception as e:
             self.log(f"⚠️ Could not get mtime for {filename}: {e}")
             return None
@@ -297,8 +314,13 @@ class SFTPDownloader:
             file_date = self.get_file_date_from_mtime(fname)
 
             if not file_date:
-                self.log(f"⚠️ Could not get modification time for {fname}, skipping")
-                error_count += 1
+                # get_file_date_from_mtime already logged why (typically the
+                # file was rotated/deleted server-side between listdir() and
+                # here, or a transient SFTP hiccup) - counted as skipped, not
+                # an error, since every observed case of this has been
+                # self-healing (the replacement file gets caught later in
+                # this same pass or the next run).
+                skipped_count += 1
                 continue
 
             # ============================================================

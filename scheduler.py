@@ -116,6 +116,9 @@ class DailyScheduler:
             logger.info("📋 Step 8: Generating Site Detail...")
             self._process_site_detail()
 
+            logger.info("🚨 Step 8.5: Archiving NOC Daily Alarm Summary...")
+            self._archive_noc_daily_alarm_summary(target_date)
+
             # Step 9: Export to Excel
             logger.info("💾 Step 9: Exporting to Excel...")
             excel_path = self.history_mgr.export_to_excel()
@@ -249,6 +252,27 @@ class DailyScheduler:
             df = generate_site_detail(day_folder, log_callback=logger.info)
             if df is not None and not df.empty:
                 self.history_mgr.update_site_detail(df, target_date=self.yesterday)
+
+    def _archive_noc_daily_alarm_summary(self, target_date):
+        """Step 8.5: Archive that day's down-site NOC alarm analysis (see
+        backend/noc_alarm_processor.build_daily_noc_alarm_report and
+        CSVHistoryManager.update_noc_daily_alarm_summary) into
+        output/csv/NOC_Daily_Alarm_Summary.csv. Read-only against the
+        sibling NOC Automation Suite's raw historical exports, so a missing/
+        unavailable feed just skips this step rather than failing the
+        pipeline - the rest of the daily report doesn't depend on it."""
+        try:
+            alarm_report = self.report_gen.build_daily_noc_alarm_report(target_date)
+            if not alarm_report.get('available'):
+                logger.info(f"NOC alarm feed not available for {target_date}, skipping archive")
+                return
+            down_summary = alarm_report.get('down_sites_summary')
+            if down_summary is None or down_summary.empty:
+                logger.info(f"No down sites recorded for {target_date}")
+                return
+            self.history_mgr.update_noc_daily_alarm_summary(down_summary)
+        except Exception as e:
+            logger.warning(f"NOC alarm summary archival failed (non-fatal): {e}")
 
     def _send_email(self, report_text, report_excel, report_word):
         """Step 11: Send email report"""

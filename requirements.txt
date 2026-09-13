@@ -32,3 +32,8 @@ python-dotenv>=1.0.0  # For environment variables (SMTP passwords)
 # Word report (copy-paste ready .docx, with embedded trend charts)
 python-docx>=1.1.0
 matplotlib>=3.8.0
+
+# Web scraping (MAE/NetEco/NCE alarm scrapers, see scrapers/)
+selenium==4.47.0
+webdriver-manager==4.1.2
+psutil==7.2.2  # scraper_watchdog.py - process liveness checks

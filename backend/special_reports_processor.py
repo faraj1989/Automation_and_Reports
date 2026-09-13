@@ -23,6 +23,7 @@ BRANCH = 'East'
 
 CITY_MAP_FILE = 'config/site_arabic_city_map.json'
 CELL_INFO_FILE = 'config/LIBYANA Cell Info.xlsx'
+HQ_TRAFFIC_TEMPLATE_FILE = 'config/Traffic and network availability Needed from Tripoli HQ.xlsx'
 
 _SITE_RE = re.compile(r'^(L[A-Z]+\d+)(-\d+)?$')
 
@@ -108,12 +109,24 @@ PRB_BUCKETS = [
 ]
 
 
-def _load_csv(csv_folder, name):
+def _load_csv(csv_folder, name, usecols=None):
     path = os.path.join(csv_folder, f"{name}.csv")
     if not os.path.exists(path):
         logger.warning(f"Special report source not found: {path}")
         return None
-    df = pd.read_csv(path)
+    if usecols is not None:
+        # The interference archives are multi-hundred-MB/millions-of-rows
+        # hourly files with far more columns than this report needs - the
+        # pyarrow engine reads only the requested columns roughly 10x
+        # faster than the default C engine here (measured: ~8s -> ~0.9s on
+        # the 685MB 4G file). Falls back to the default engine if pyarrow
+        # isn't installed on a given machine.
+        try:
+            df = pd.read_csv(path, usecols=usecols, engine='pyarrow')
+        except Exception:
+            df = pd.read_csv(path, usecols=usecols)
+    else:
+        df = pd.read_csv(path)
     return df if not df.empty else None
 
 
@@ -375,21 +388,36 @@ def _period_cols(dates: pd.Series, period: str):
     dashboard's additional zoom levels. sort_key is always a real
     chronological ordinal, separate from label - sorting by the 'month'
     label string directly would put "August" before "July" before
-    "September" (plain alphabetical), not calendar order."""
-    year = dates.dt.year
+    "September" (plain alphabetical), not calendar order.
+
+    Computed once per UNIQUE date, then broadcast back over the full
+    `dates` Series via a dict lookup, instead of running .dt.strftime()
+    (or any other per-row accessor) over every row directly. The 3G/4G
+    interference archives are multi-million-row hourly data with at most
+    a few hundred distinct calendar days in them, and .dt.strftime() on
+    the full row count (not the groupby chain, not even reading the
+    underlying multi-hundred-MB CSVs) was measured to be THE dashboard
+    bottleneck - ~40s per call on a 6.5M-row file just to label rows with
+    a month name that's identical for ~200,000 of them at a time."""
+    unique_dates = pd.Series(dates.unique())
+    u_year = unique_dates.dt.year
     if period == 'day':
-        label = dates.dt.strftime('%Y-%m-%d')
-        sort_key = label
+        u_label = unique_dates.dt.strftime('%Y-%m-%d')
+        u_sort_key = u_label
     elif period == 'week':
-        iso = dates.dt.isocalendar()
-        sort_key = iso.week.astype(int)
-        label = 'W' + iso.week.astype(str).str.zfill(2)
+        iso = unique_dates.dt.isocalendar()
+        u_sort_key = iso.week.astype(int)
+        u_label = 'W' + iso.week.astype(str).str.zfill(2)
     elif period == 'quarter':
-        sort_key = dates.dt.quarter
-        label = 'Q' + sort_key.astype(str)
+        u_sort_key = unique_dates.dt.quarter
+        u_label = 'Q' + u_sort_key.astype(str)
     else:
-        sort_key = dates.dt.month
-        label = dates.dt.strftime('%B')
+        u_sort_key = unique_dates.dt.month
+        u_label = unique_dates.dt.strftime('%B')
+
+    year = dates.map(dict(zip(unique_dates, u_year)))
+    label = dates.map(dict(zip(unique_dates, u_label)))
+    sort_key = dates.map(dict(zip(unique_dates, u_sort_key)))
     return year, label, sort_key
 
 
@@ -458,21 +486,24 @@ def build_external_interference_report(csv_folder='output/csv', period='month',
                          'Band': band, 'Count of Cells with External interference': count,
                          'Total count of cells': total})
 
-    # ---- 3G / 4G (shared shape: hourly threshold -> interfered-hours/day -> any day >= N hours) ----
-    for tech, sheet, metric_col, threshold, band_col, band_map in [
-        ('3G', '3G_Interference_Hourly', 'VS.MeanRTWP', -95, 'DL frequency', _3G_BAND_MAP),
-        ('4G', '4G_Interference_Hourly', 'L.UL.Interference.Avg(dBm)', -100, 'Frequency band', _4G_BAND_MAP),
-    ]:
-        df = _load_csv(csv_folder, sheet)
-        if df is None or band_col not in df.columns or metric_col not in df.columns:
+    # ---- 3G / 4G (shared shape: any day with >= N interfered hours flags the cell) ----
+    # Reads the small BadHours-per-(Cell,Band,Date) rollup
+    # (backend/interference_processor.py's build_daily_rollup/
+    # update_daily_rollup, kept current by CSVHistoryManager.
+    # update_interference_kpis), NOT the raw hourly archives directly -
+    # those are multi-hundred-MB and grow every week with no cap by
+    # design, and a plain read of them has been observed to raise
+    # MemoryError on a machine already under normal desktop load. The
+    # rollup already has "was this cell/band bad, and how many hours,
+    # on this day" precomputed, so nothing here needs to touch a metric
+    # threshold or an hourly timestamp at all.
+    for tech, rollup_sheet in [('3G', '3G_Interference_Daily'), ('4G', '4G_Interference_Daily')]:
+        df = _load_csv(csv_folder, rollup_sheet)
+        if df is None or 'BadHours' not in df.columns:
             continue
         df = df.copy()
-        df['Date'] = pd.to_datetime(df['Time'], errors='coerce').dt.floor('D')
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df.dropna(subset=['Date'])
-        df['_metric'] = pd.to_numeric(df[metric_col], errors='coerce')
-        df['Band'] = pd.to_numeric(df[band_col], errors='coerce').map(band_map)
-        df = df.dropna(subset=['Band'])
-        df['_is_interfered_hour'] = df['_metric'] > threshold
 
         year, label, sort_key = _period_cols(df['Date'], period)
         df['Year'], df['Period'], df['SortKey'] = year, label, sort_key
@@ -480,8 +511,7 @@ def build_external_interference_report(csv_folder='output/csv', period='month',
         total_per_band = df.groupby(['Year', 'Period', 'Band'])['Cell Name'].nunique()
         sort_key_map = df.groupby(['Year', 'Period'])['SortKey'].first()
 
-        daily_hours = df.groupby(['Cell Name', 'Band', 'Year', 'Period', 'Date'])['_is_interfered_hour'].sum().reset_index(name='Hours')
-        bad_cell_days = daily_hours[daily_hours['Hours'] >= umts_lte_hourly_threshold_hours]
+        bad_cell_days = df[df['BadHours'] >= umts_lte_hourly_threshold_hours]
         interfered_cells = bad_cell_days[['Cell Name', 'Band', 'Year', 'Period']].drop_duplicates()
         interfered_per_band = interfered_cells.groupby(['Year', 'Period', 'Band'])['Cell Name'].nunique()
 
@@ -498,6 +528,146 @@ def build_external_interference_report(csv_folder='output/csv', period='month',
     # mixing both in one object column is what Streamlit's Arrow conversion above was choking on.
     result['Band'] = result['Band'].astype(str)
     return result
+
+
+# Sheet1 of the Tripoli-HQ template is 5 side-by-side (Month, Value) column
+# pairs, one row per calendar month (row N+1 = month N), EAST branch only.
+# Column letter -> tidy field name (None = the repeated "Month" index column).
+HQ_TRAFFIC_COLUMNS = {
+    'A': None, 'B': '4G PS Traffic (TB)',
+    'C': None, 'D': 'Gi Interface Traffic (TB)',
+    'E': None, 'F': 'DL PRB Utilization (%)',
+    'G': None, 'H': '2G Network Availability (%)',
+    'I': None, 'J': 'Avg DL Throughput per User (Mbps)',
+}
+HQ_TRAFFIC_METRICS = [v for v in HQ_TRAFFIC_COLUMNS.values() if v]
+
+
+def load_hq_traffic_history(path=HQ_TRAFFIC_TEMPLATE_FILE) -> pd.DataFrame:
+    """Reads Sheet1 of the Tripoli-HQ 'Traffic and network availability'
+    template as a tidy one-row-per-month table (percent columns converted
+    from the file's 0-1 fraction to plain 0-100, matching how percentages
+    are shown everywhere else in this dashboard). Months not yet filled in
+    (all 4 values blank, e.g. the current month before compute_hq_traffic_month
+    has been run for it) are dropped."""
+    empty = pd.DataFrame(columns=['Month'] + HQ_TRAFFIC_METRICS)
+    if not os.path.exists(path):
+        return empty
+    try:
+        raw = pd.read_excel(path, sheet_name='Sheet1', header=0)
+    except Exception:
+        logger.warning(f"Could not read HQ traffic template: {path}", exc_info=True)
+        return empty
+    if raw.shape[1] < len(HQ_TRAFFIC_COLUMNS):
+        return empty
+
+    out = pd.DataFrame({'Month': raw.iloc[:, 0]})
+    for col_letter, field in HQ_TRAFFIC_COLUMNS.items():
+        if field is None:
+            continue
+        idx = ord(col_letter) - ord('A')
+        values = pd.to_numeric(raw.iloc[:, idx], errors='coerce')
+        out[field] = values * 100 if '%' in field else values
+
+    out = out.dropna(subset=['Month'])
+    out = out[out[HQ_TRAFFIC_METRICS].notna().any(axis=1)]
+    out['Month'] = out['Month'].astype(int)
+    return out.sort_values('Month').reset_index(drop=True)
+
+
+def compute_hq_traffic_month(csv_folder='output/csv', year=None, month=None) -> dict:
+    """Computes the 5 Tripoli-HQ 'Traffic and network availability' metrics
+    for one calendar month, EAST branch, straight from the pipeline's own
+    output/csv/ history - the same 5 metrics as Sheet1 of the HQ template:
+
+      - 4G PS Traffic (TB): sum of 'PS 4G Sgi_traffic (TB)' (Gi_Interface_Traffic.csv)
+      - Gi Interface Traffic (TB): sum of 'PS 234G traffic (TB)', the combined
+        2G/3G/4G Gi/Sgi volume (same file)
+      - DL PRB Utilization (%): mean of 'DL PRB Utilizing Rate(%)' (4G_NW_Daily.csv)
+      - 2G Network Availability (%): mean of 'RR307:TCH Availability(%)'
+        (2G_NW_Daily.csv) - the GSM availability KPI per config/kpi_thresholds.csv
+      - Avg DL Throughput per User (Mbps): mean of 'User Downlink Average
+        Throughput (Mbps)' (4G_NWBH.csv - whole-network busy-hour figure;
+        the per-cell 4G_Cell_BH.csv average runs ~2x higher because it's an
+        unweighted mean across cells of very different load, so it doesn't
+        match this template's existing Jan-Jul scale the way the network-level
+        busy-hour KPI does)
+
+    A metric is left as None when its source has no rows that month at all.
+    `coverage` reports (days_with_data, days_in_month) per source so a partial
+    month (e.g. ingestion only started mid-month) is visible rather than
+    silently averaged/summed as if the month were complete."""
+    import calendar as _calendar
+    days_in_month = _calendar.monthrange(year, month)[1]
+
+    def _month_slice(df):
+        d = pd.to_datetime(df['Date'], errors='coerce')
+        return df[(d.dt.year == year) & (d.dt.month == month)]
+
+    result = {'Month': month, 'Year': year, 'coverage': {}}
+    for field in HQ_TRAFFIC_METRICS:
+        result[field] = None
+
+    gi = _load_csv(csv_folder, 'Gi_Interface_Traffic')
+    if gi is not None and 'Date' in gi.columns:
+        gi_m = _month_slice(gi)
+        if not gi_m.empty:
+            result['4G PS Traffic (TB)'] = pd.to_numeric(gi_m['PS 4G Sgi_traffic (TB)'], errors='coerce').sum()
+            result['Gi Interface Traffic (TB)'] = pd.to_numeric(gi_m['PS 234G traffic (TB)'], errors='coerce').sum()
+            result['coverage']['Gi_Interface_Traffic.csv'] = (len(gi_m), days_in_month)
+
+    nw4g = _load_csv(csv_folder, '4G_NW_Daily')
+    if nw4g is not None and 'Date' in nw4g.columns:
+        nw4g_m = _month_slice(nw4g)
+        if not nw4g_m.empty:
+            result['DL PRB Utilization (%)'] = pd.to_numeric(nw4g_m['DL PRB Utilizing Rate(%)'], errors='coerce').mean()
+            result['coverage']['4G_NW_Daily.csv'] = (len(nw4g_m), days_in_month)
+
+    nw2g = _load_csv(csv_folder, '2G_NW_Daily')
+    if nw2g is not None and 'Date' in nw2g.columns:
+        nw2g_m = _month_slice(nw2g)
+        if not nw2g_m.empty:
+            result['2G Network Availability (%)'] = pd.to_numeric(nw2g_m['RR307:TCH Availability(%)'], errors='coerce').mean()
+            result['coverage']['2G_NW_Daily.csv'] = (len(nw2g_m), days_in_month)
+
+    nwbh4g = _load_csv(csv_folder, '4G_NWBH')
+    if nwbh4g is not None and 'Date' in nwbh4g.columns:
+        nwbh4g_m = _month_slice(nwbh4g)
+        if not nwbh4g_m.empty:
+            result['Avg DL Throughput per User (Mbps)'] = pd.to_numeric(
+                nwbh4g_m['User Downlink Average Throughput (Mbps)'], errors='coerce').mean()
+            result['coverage']['4G_NWBH.csv'] = (len(nwbh4g_m), days_in_month)
+
+    return result
+
+
+def save_hq_traffic_month(computed: dict, path=HQ_TRAFFIC_TEMPLATE_FILE) -> None:
+    """Writes one month's computed values into Sheet1 of the Tripoli-HQ
+    template in place - values only, so Sheet2 and all existing formatting
+    survive - the same file then accumulates real monthly history (row N+1
+    = month N) the way it already holds Jan-Jul, and next month only the
+    newest row needs computing. Percent fields are stored back as the
+    file's native 0-1 fraction. Skips any metric that is None (nothing
+    computed for it) rather than blanking out a previously-saved value."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path)
+    ws = wb['Sheet1']
+    row = computed['Month'] + 1  # header is row 1, month N is row N+1
+
+    for col_letter, field in HQ_TRAFFIC_COLUMNS.items():
+        cell = ws[f'{col_letter}{row}']
+        if field is None:
+            cell.value = computed['Month']
+        else:
+            value = computed.get(field)
+            if value is None:
+                continue
+            cell.value = (value / 100) if '%' in field else value
+        above = ws[f'{col_letter}{row - 1}']
+        if above.number_format and above.number_format != 'General':
+            cell.number_format = above.number_format
+
+    wb.save(path)
 
 
 def build_nq_template_report(csv_folder='output/csv', interference_period='month') -> dict:

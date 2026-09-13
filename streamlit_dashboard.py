@@ -24,7 +24,12 @@ from backend.report_generator import (
     ReportGenerator, TECH_LABELS, CELL_SHEETS, SCORECARD_SHEETS, SITE_COL_BY_TECH, autofit_excel_columns,
 )
 from backend import ept_manager as ept
-from backend.special_reports_processor import build_nq_template_report
+from backend.special_reports_processor import (
+    build_nq_template_report, load_hq_traffic_history, compute_hq_traffic_month,
+    save_hq_traffic_month, HQ_TRAFFIC_TEMPLATE_FILE, HQ_TRAFFIC_METRICS,
+)
+from backend.topology_processor import build_site_topology_csv, find_topology_xlsx
+from backend import smartcare_cem_processor as smartcare_cem
 
 st.set_page_config(page_title="Libyana Network Dashboard", page_icon="📊", layout="wide")
 
@@ -75,6 +80,7 @@ def cached_bundle(target_date, previous_date):
         site_cards=rg.build_site_summary_cards(target_date),
         freshness=rg.build_data_freshness(target_date),
         trend=rg.build_trend(target_date, days=14),
+        alarm_report=rg.build_daily_noc_alarm_report(target_date),
     )
 
 
@@ -128,6 +134,119 @@ def cached_cell_dimensions(tech, sheet):
     return rg.get_trend_kpi_dimensions(tech, sheet=sheet)
 
 
+@st.cache_data(ttl=600)
+def cached_site_capacity_advice(site_names, target_date):
+    return rg.build_site_capacity_advice(list(site_names), target_date)
+
+
+@st.cache_data(ttl=600)
+def cached_site_topology(site_names):
+    return rg.get_site_topology(list(site_names))
+
+
+@st.cache_data(ttl=600)
+def cached_site_detail_summary():
+    return rg.build_site_detail_summary()
+
+
+@st.cache_data(ttl=600)
+def cached_packet_loss_report(period, target_date):
+    return rg.build_packet_loss_report(period, target_date)
+
+
+@st.cache_data(ttl=600)
+def cached_topology_table():
+    path = os.path.join('config', 'site_topology.csv')
+    return pd.read_csv(path) if os.path.exists(path) else None
+
+
+# Shorter TTL than the rest (600s) since the underlying live alarm feed
+# refreshes every ~5 min upstream - a 10-min-stale cache would mask a
+# genuinely fresh update for no benefit.
+@st.cache_data(ttl=180)
+def cached_alarm_overview():
+    return rg.build_alarm_overview()
+
+
+@st.cache_data(ttl=180)
+def cached_site_alarm_status(site_names):
+    return rg.get_site_alarm_status(list(site_names))
+
+
+# Raw historical exports this reads are retained only a few days upstream
+# and don't change once a day has fully elapsed, but today's/yesterday's
+# figures can still firm up as later cycles capture more Cleared-On times
+# - a short TTL, same as the rest of the Alarms section, keeps that timely
+# without re-parsing the raw exports on every rerun.
+@st.cache_data(ttl=180)
+def cached_daily_noc_alarm_report(target_date):
+    return rg.build_daily_noc_alarm_report(target_date)
+
+
+# SmartCare CEM refreshes weekly upstream - the long TTL just avoids
+# re-reading the workbook from disk on every rerun within a session.
+@st.cache_data(ttl=3600)
+def cached_cem_overview():
+    return rg.build_cem_overview()
+
+
+@st.cache_data(ttl=3600)
+def cached_device_penetration_overview():
+    return rg.build_device_penetration_overview()
+
+
+def render_site_detail_and_advice(site_names, target_date, key_prefix):
+    """Shared block for Cell Explorer/Special Reports: SiteDetail config
+    (bands/scenario/RAT) for the selected site(s), rule-based capacity
+    recommendations (config-aware: names a free band slot to activate, or
+    flags a sector/cabinet upgrade when none remain), and FN/HUB topology
+    (which transmission node this site depends on, and which other sites
+    share it - useful for spotting "shared infrastructure" root causes
+    instead of investigating each site as an isolated RF problem)."""
+    site_detail = cached_sheet('SiteDetail')
+    st.subheader("🏗️ Site Detail")
+    if site_detail is None or 'Site Name' not in site_detail.columns:
+        st.info("SiteDetail.csv not found.")
+    else:
+        rows = site_detail[site_detail['Site Name'].isin(site_names)]
+        if rows.empty:
+            st.info("No SiteDetail entry for the selected site(s).")
+        else:
+            st.dataframe(rows, width='stretch', hide_index=True)
+
+    st.subheader("🔗 FN/HUB Topology")
+    topo_rows = cached_site_topology(tuple(site_names))
+    if topo_rows is None or topo_rows.empty:
+        st.info("No FN/HUB topology entry for the selected site(s) - either not in the reference file, or not a fiber-node-dependent site.")
+    else:
+        st.dataframe(topo_rows, width='stretch', hide_index=True)
+        st.caption("If several sites you're investigating together share the same FN/HUB Node, a transmission "
+                   "issue at that node - not independent RF problems - is worth ruling out first.")
+
+    st.subheader("💡 Capacity Recommendations")
+    advice = cached_site_capacity_advice(tuple(site_names), target_date)
+    if advice is None or advice.empty:
+        st.info("No capacity data available for the selected site(s) on this date.")
+    else:
+        st.dataframe(advice, width='stretch', hide_index=True)
+
+    st.subheader("🚨 Alarm Status (NOC Feed)")
+    alarm_status = cached_site_alarm_status(tuple(site_names))
+    current_alarm, chronic, downtime = alarm_status['current'], alarm_status['chronic'], alarm_status['downtime']
+    if not current_alarm.empty:
+        st.error(f"⚠️ {len(current_alarm)} of the selected site(s) currently show an active disconnect/power alarm:")
+        st.dataframe(current_alarm, width='stretch', hide_index=True)
+    if not chronic.empty:
+        st.caption("Chronic alarm history for the selected site(s):")
+        st.dataframe(chronic, width='stretch', hide_index=True)
+    if not downtime.empty:
+        st.caption("Historical downtime for the selected site(s):")
+        st.dataframe(downtime, width='stretch', hide_index=True)
+    if current_alarm.empty and chronic.empty and downtime.empty:
+        st.caption("No current or historical alarm data for the selected site(s) "
+                   "(or the NOC alarm feed isn't available on this machine).")
+
+
 DIMENSION_ORDER = ["Accessibility", "Retainability", "Mobility", "Resource Utilization", "Quality"]
 
 
@@ -161,7 +280,7 @@ def cached_word_bytes(target_date, previous_date):
     path = rg.generate_word_report(
         target_date, previous_date, b['health'], b['scorecards'], b['worst_cells'],
         b['site_health'], b['topology'], b['traffic'], b['site_inventory'],
-        b['freshness'], b['trend'],
+        b['freshness'], b['trend'], b['alarm_report'],
     )
     with open(path, 'rb') as f:
         return f.read()
@@ -173,6 +292,7 @@ def cached_excel_bytes(target_date, previous_date):
     path = rg.generate_excel_report(
         target_date, b['health'], b['scorecards'], b['worst_cells'], b['site_health'],
         b['topology'], b['traffic'], b['site_inventory'], b['freshness'], b['trend'],
+        b['alarm_report'],
     )
     with open(path, 'rb') as f:
         return f.read()
@@ -194,6 +314,11 @@ def cached_nq_template_bytes(interference_period='month'):
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
         autofit_excel_columns(writer)
     return buf.getvalue()
+
+
+@st.cache_data(ttl=600)
+def cached_hq_traffic_history():
+    return load_hq_traffic_history()
 
 
 @st.cache_data(ttl=600)
@@ -325,6 +450,23 @@ def render_word_export_button(title, tables, key_prefix, subtitle=""):
         )
 
 
+def render_excel_export_button(title, tables, key_prefix, subtitle=""):
+    """Same idea as render_word_export_button, but for a one-click .xlsx
+    export of a tab's underlying tables - one sheet per table - for teams
+    that want to filter/pivot the numbers rather than read a document."""
+    if st.button("📊 Export as Excel", key=f"{key_prefix}_excel_btn"):
+        with st.spinner("Building Excel report..."):
+            st.session_state[f"{key_prefix}_excel_bytes"] = rg.generate_tables_excel_report(
+                title, tables, subtitle=subtitle)
+    if f"{key_prefix}_excel_bytes" in st.session_state:
+        st.download_button(
+            "⬇️ Download", data=st.session_state[f"{key_prefix}_excel_bytes"],
+            file_name=f"{key_prefix}_{target_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_excel_dl",
+        )
+
+
 # ============================================================
 # HEADER + SIDEBAR
 # ============================================================
@@ -357,7 +499,8 @@ with st.sidebar:
     section = st.radio(
         "Section",
         ["📊 Overview", "📡 KPIs & Performance", "🏗️ Sites & Infrastructure",
-         "🔎 Investigate", "📋 HQ Reports", "📧 Reports"],
+         "📶 Packet Loss", "🚨 Alarms", "📱 CEM", "🔎 Investigate",
+         "📋 HQ Reports", "📧 Reports"],
         key="nav_section", label_visibility="collapsed",
     )
 
@@ -489,6 +632,33 @@ elif section == "📡 KPIs & Performance":
             key_prefix="traffic", subtitle=target_date,
         )
 
+        gi_df = cached_sheet('Gi_Interface_Traffic')
+        if gi_df is not None and not gi_df.empty:
+            with st.expander("🌐 Core Network — Gi/Sgi Traffic Trend (14-day)", expanded=False):
+                gi_trend = gi_df.copy()
+                gi_trend['Date'] = pd.to_datetime(gi_trend['Date'], errors='coerce')
+                gi_trend = gi_trend.sort_values('Date').tail(14)
+                gi_cols = [
+                    'PS core_Gi _23G traffic (TB)', 'PS 4G Sgi_traffic (TB)',
+                    'PS 234G traffic (TB)', 'PGW-C current VoLTE IMS subscribers(number)',
+                ]
+                gi_cols = [c for c in gi_cols if c in gi_trend.columns]
+                gi_table = gi_trend[['Date'] + gi_cols].copy()
+                gi_table['Date'] = gi_table['Date'].dt.strftime('%Y-%m-%d')
+
+                st.dataframe(gi_table, width='stretch', hide_index=True)
+
+                cols = st.columns(2)
+                for i, kpi in enumerate(gi_cols):
+                    with cols[i % 2]:
+                        render_trend_chart(gi_trend, kpi, None, key=f"trend_gi_{kpi}")
+
+                render_excel_export_button(
+                    "Core Network — Gi/Sgi Traffic Trend",
+                    [("Gi_Sgi_Traffic_Trend", gi_table)],
+                    key_prefix="gi_traffic_trend", subtitle=f"Last {len(gi_table)} day(s) — {target_date}",
+                )
+
     with sec_tabs[3]:
         sub = st.tabs(list(TECH_LABELS.values()))
         for sub_tab, (tech, label) in zip(sub, TECH_LABELS.items()):
@@ -526,28 +696,62 @@ elif section == "📡 KPIs & Performance":
         )
 
 # ============================================================
-# 🏗️ SITES & INFRASTRUCTURE — Site Health & Topology, Site Inventory, EPT
+# 🏗️ SITES & INFRASTRUCTURE — Site Health & Topology, Site Inventory,
+# Site Detail, EPT
 # ============================================================
 elif section == "🏗️ Sites & Infrastructure":
-    sec_tabs = st.tabs(["🏗️ Site Health & Topology", "🏢 Site Inventory", "🗺️ EPT"])
+    sec_tabs = st.tabs(["🏗️ Site Health & Topology", "🏢 Site Inventory", "📋 Site Detail", "🗺️ EPT"])
 
     with sec_tabs[0]:
         st.dataframe(bundle['site_health'], width='stretch', hide_index=True)
         topo = bundle['topology']
-        if topo.get('loaded'):
-            st.success(
-                f"Topology reference loaded: {topo['nodes']} nodes "
-                f"({topo['fn_count']} FN, {topo['hub_count']} HUB), "
-                f"{topo['site_relationships']} site relationships, "
-                f"regions: {', '.join(topo['regions'])}."
-            )
-        else:
-            st.warning("Topology reference file not found.")
+        topo_col, refresh_col = st.columns([4, 1])
+        with topo_col:
+            if topo.get('loaded'):
+                st.success(
+                    f"Topology reference loaded: {topo['nodes']} nodes "
+                    f"({topo['fn_count']} FN, {topo['hub_count']} HUB), "
+                    f"{topo['site_relationships']} site relationships, "
+                    f"regions: {', '.join(topo['regions'])}."
+                )
+            else:
+                st.warning("Topology reference file not found.")
+        with refresh_col:
+            xlsx_path = find_topology_xlsx()
+            if st.button("🔄 Rebuild from Excel", width='stretch',
+                         help=f"Re-parse {os.path.basename(xlsx_path) if xlsx_path else 'the FN-HUB Excel file'} "
+                              "in config/ - use after updating it.",
+                         disabled=not xlsx_path):
+                with st.spinner("Re-parsing topology Excel reference..."):
+                    build_site_topology_csv()
+                cached_bundle.clear()
+                cached_topology_table.clear()
+                cached_site_topology.clear()
+                st.rerun()
         st.caption("Alarm-to-topology impact correlation is Phase 3/4, pending NetEco integration.")
         render_word_export_button(
             "Site Health & Topology", [("Availability by Technology", bundle['site_health'])],
             key_prefix="site_health", subtitle=target_date,
         )
+
+        if topo.get('loaded'):
+            st.divider()
+            st.subheader("🔗 FN/HUB Site Lookup")
+            st.caption("Which FN/HUB node a site depends on, and which other sites share it - useful before "
+                       "investigating several problem sites as independent RF issues.")
+            topo_search = st.text_input("Site Name contains...", "", key="topo_search")
+            all_topo = cached_topology_table()
+            if all_topo is not None and not all_topo.empty:
+                if topo_search:
+                    site_matches = sorted(all_topo[all_topo['Connected_Site'].str.contains(
+                        topo_search, case=False, na=False)]['Connected_Site'].unique().tolist())
+                    lookup_result = cached_site_topology(tuple(site_matches)) if site_matches else pd.DataFrame()
+                    if lookup_result.empty:
+                        st.info("No matching site found in the topology reference.")
+                    else:
+                        st.dataframe(lookup_result, width='stretch', hide_index=True)
+                with st.expander(f"📋 Browse all {len(all_topo):,} relationships"):
+                    st.dataframe(all_topo, width='stretch', hide_index=True, height=400)
 
     with sec_tabs[1]:
         st.dataframe(bundle['site_inventory'], width='stretch', hide_index=True)
@@ -558,6 +762,46 @@ elif section == "🏗️ Sites & Infrastructure":
         )
 
     with sec_tabs[2]:
+        sd_summary = cached_site_detail_summary()
+        if not sd_summary.get('loaded'):
+            st.warning("SiteDetail.csv not found.")
+        else:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Sites", f"{sd_summary['total_sites']:,}")
+            m2.metric("Multi-Carrier LTE Sites", f"{sd_summary['multi_carrier_lte_sites']:,}")
+            m3.metric("Single-Carrier LTE Sites", f"{sd_summary['single_carrier_lte_sites']:,}",
+                      help="Only one 4G band slot active - the first place to look for a free-capacity "
+                           "upgrade if a site here is also PRB-congested (see Investigate tab).")
+            m4.metric("No LTE Yet", f"{sd_summary['no_lte_sites']:,}")
+
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                st.caption("RAT combination")
+                st.dataframe(pd.Series(sd_summary['rat_counts'], name='Sites').sort_values(ascending=False),
+                             width='stretch')
+            with bc2:
+                st.caption("Scenario")
+                st.dataframe(pd.Series(sd_summary['scenario_counts'], name='Sites').sort_values(ascending=False),
+                             width='stretch')
+            with bc3:
+                st.caption("4G band adoption (sites with slot active)")
+                st.dataframe(pd.Series(sd_summary['band_adoption'], name='Sites').sort_values(ascending=False),
+                             width='stretch')
+
+            st.divider()
+            sd_search = st.text_input("Filter by Site Name contains...", "", key="site_detail_search")
+            sd_table = cached_sheet('SiteDetail')
+            if sd_table is not None and not sd_table.empty:
+                if sd_search:
+                    sd_table = sd_table[sd_table['Site Name'].str.contains(sd_search, case=False, na=False)]
+                st.caption(f"{len(sd_table):,} site(s)")
+                st.dataframe(sd_table, width='stretch', hide_index=True, height=450)
+                render_word_export_button(
+                    "Site Detail", [("Site Detail", sd_table)],
+                    key_prefix="site_detail_all", subtitle=target_date,
+                )
+
+    with sec_tabs[3]:
         ept_last_updated = ept.get_ept_last_updated()
         ept_file_bytes = ept.get_ept_file_bytes()
 
@@ -639,6 +883,385 @@ elif section == "🏗️ Sites & Infrastructure":
                 st.dataframe(ept_filtered, width='stretch', hide_index=True, height=400)
 
 # ============================================================
+# 📶 PACKET LOSS — IUB/ABIS backhaul ping quality (Transmission_KPIs.csv,
+# already archived by backend/transmission_kpi_processor.py)
+# ============================================================
+elif section == "📶 Packet Loss":
+    st.caption("IUB/ABIS backhaul ping packet loss & delay, ranked by Avg Packet Loss(%) descending. "
+               "A site/adjacency appearing here consistently across day/week/month is a transport link "
+               "issue worth escalating, not a one-off blip.")
+
+    pl_period_labels = {'Day': 'day', 'Last 7 Days': 'week', 'Last 30 Days': 'month'}
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        pl_period_choice = st.radio("Period", list(pl_period_labels.keys()), key="pl_period")
+    pl_period = pl_period_labels[pl_period_choice]
+
+    pl_report = cached_packet_loss_report(pl_period, target_date)
+    if pl_report is None or pl_report.empty:
+        st.info("No Transmission KPI data available for this period.")
+    else:
+        elevated_threshold = rg.PACKET_LOSS_ELEVATED_PCT
+        elevated = pl_report[pl_report['Avg Packet Loss(%)'] > elevated_threshold]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Adjacencies Reporting", f"{len(pl_report):,}")
+        m2.metric(f"Elevated (Avg > {elevated_threshold}%)", f"{len(elevated):,}")
+        m3.metric("Worst Avg Packet Loss", f"{pl_report['Avg Packet Loss(%)'].max():.2f}%")
+
+        pl_search = st.text_input("Filter by Site Name / Adjacent Node Name contains...", "", key="pl_search")
+        pl_filtered = pl_report
+        if pl_search:
+            name_cols = [c for c in ['Site Name', 'Adjacent Node Name'] if c in pl_filtered.columns]
+            mask = False
+            for c in name_cols:
+                mask = mask | pl_filtered[c].astype(str).str.contains(pl_search, case=False, na=False)
+            pl_filtered = pl_filtered[mask]
+
+        st.caption(f"{len(pl_filtered):,} adjacenc(y/ies) — {pl_period_choice.lower()}, ending {target_date}")
+        st.dataframe(pl_filtered, width='stretch', hide_index=True, height=450)
+        render_word_export_button(
+            "Packet Loss", [(f"Packet Loss ({pl_period_choice})", pl_filtered)],
+            key_prefix="packet_loss", subtitle=target_date,
+        )
+
+# ============================================================
+# 🚨 ALARMS — live site alarm status + historical NOC rollups
+# (read-only feed from a sibling NOC Automation Suite; see
+# backend/noc_alarm_processor.py)
+# ============================================================
+elif section == "🚨 Alarms":
+    st.caption("Live site alarm status and historical chronic-offender/downtime trends from the NOC "
+               "alarm pipeline (MAE/NetEco/NCE). This reads a separate automation suite's output "
+               "read-only - if that suite isn't installed or running on this machine, this section "
+               "stays empty instead of erroring.")
+
+    alarm_overview = cached_alarm_overview()
+    live, hist = alarm_overview['live'], alarm_overview['historical']
+
+    if not live.get('loaded') and not hist.get('loaded'):
+        st.info("No NOC alarm feed found. This section reads the output of a separate NOC automation "
+                "suite (MAE/NetEco/NCE alarm scrapers) when it's installed and running on this machine.")
+    else:
+        st.subheader("🔌 Currently Disconnected Sites")
+        if live.get('loaded'):
+            age = live['age_minutes']
+            if live.get('is_stale'):
+                st.warning(f"⚠️ Live alarm feed last updated {age:.0f} min ago — the alarm scraper "
+                           f"pipeline may be stalled; treat current-alarm counts below as possibly stale.")
+            else:
+                st.caption(f"✅ Live feed updated {age:.0f} min ago" if age is not None else "✅ Live feed found")
+
+            alarms_df = live['alarms']
+            live_metrics = live.get('metrics', {})
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Count of NE Is Disconnected", f"{live_metrics.get('ne_disconnected', len(alarms_df)):,}")
+            m2.metric("Count of Mains Failure", f"{live_metrics.get('mains_failure', 0):,}")
+            m3.metric("Count of NCE Transmission Alarm Sites", f"{live_metrics.get('nce_transmission', 0):,}")
+
+            alarm_search = st.text_input("Filter by Site Name contains...", "", key="alarm_search")
+            alarms_filtered = alarms_df
+            if alarm_search and 'Site Name' in alarms_filtered.columns:
+                alarms_filtered = alarms_filtered[
+                    alarms_filtered['Site Name'].astype(str).str.contains(alarm_search, case=False, na=False)]
+            st.dataframe(alarms_filtered, width='stretch', hide_index=True, height=350)
+            render_word_export_button(
+                "Currently Disconnected Sites", [("Disconnected Sites", alarms_filtered)],
+                key_prefix="live_disconnected", subtitle=pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+            )
+        else:
+            st.info("Live current-alarm feed not found.")
+
+        st.divider()
+        st.subheader("📊 Historical Alarm Insights")
+        if hist.get('loaded'):
+            age_txt = f" ({hist['age_minutes']:.0f} min ago)" if hist['age_minutes'] is not None else ""
+            if hist.get('is_stale'):
+                st.warning(f"⚠️ Historical rollup generated {hist['generated_at']}{age_txt} — more than 2 "
+                           f"days old, the historical alarm scraper pipeline may be stalled.")
+            else:
+                st.caption(f"Generated {hist['generated_at']}{age_txt}")
+
+            hist_tabs = st.tabs(["🔁 Chronic Offenders", "⏱️ Site Downtime", "📈 Daily Trend", "📂 Category Rollup"])
+            with hist_tabs[0]:
+                co = hist['chronic_offenders']
+                if co.empty:
+                    st.info("No chronic-offender data.")
+                else:
+                    co_search = st.text_input("Filter by Site contains...", "", key="co_search")
+                    co_filtered = co[co['Site'].astype(str).str.contains(co_search, case=False, na=False)] \
+                        if co_search and 'Site' in co.columns else co
+                    sort_col = 'Occurrences' if 'Occurrences' in co_filtered.columns else co_filtered.columns[0]
+                    st.dataframe(co_filtered.sort_values(sort_col, ascending=False),
+                                 width='stretch', hide_index=True, height=400)
+            with hist_tabs[1]:
+                sd = hist['site_downtime']
+                if sd.empty:
+                    st.info("No site downtime data.")
+                else:
+                    sort_col = 'Total Outage Minutes' if 'Total Outage Minutes' in sd.columns else sd.columns[0]
+                    st.dataframe(sd.sort_values(sort_col, ascending=False),
+                                 width='stretch', hide_index=True, height=400)
+            with hist_tabs[2]:
+                dt = hist['daily_trend']
+                if dt.empty:
+                    st.info("No daily trend data.")
+                else:
+                    st.dataframe(dt, width='stretch', hide_index=True)
+            with hist_tabs[3]:
+                cr = hist['category_rollup']
+                if cr.empty:
+                    st.info("No category rollup data.")
+                else:
+                    st.dataframe(cr, width='stretch', hide_index=True)
+        else:
+            st.info("Historical alarm insights snapshot not found.")
+
+        st.divider()
+        st.subheader("📅 Daily NOC Alarm Analysis")
+        st.caption("Pick any day to see how many sites went down, total summed downtime hours, and each "
+                   "down site's NetEco (power) and NCE (transmission) alarm evidence merged into one row. "
+                   "Computed directly from this project's own raw MAE/NetEco/NCE historical exports, as "
+                   "far back as their retention window covers (currently a couple of weeks).")
+
+        daily_date = st.date_input("Date", value=pd.Timestamp.now().normalize() - pd.Timedelta(days=1),
+                                    key="daily_noc_alarm_date")
+        daily_report = cached_daily_noc_alarm_report(daily_date.strftime('%Y-%m-%d'))
+
+        if not daily_report.get('available'):
+            st.info(f"No raw historical alarm export covers {daily_date} — either the NOC alarm feed "
+                    f"isn't available on this machine, or that date has aged out of the retention window.")
+        else:
+            src_status = " | ".join(
+                f"{src}: {'✅' if info['available'] else '❌ unavailable'}"
+                for src, info in daily_report['sources'].items()
+            )
+            st.caption(src_status)
+
+            daily_metrics = daily_report.get('metrics', {})
+            dm1, dm2, dm3, dm4 = st.columns(4)
+            dm1.metric("Count of NE Is Disconnected", f"{daily_report['sites_down']:,}")
+            dm2.metric("Total Downtime (Hours)", f"{daily_report['total_down_hours']:,.1f}")
+            dm3.metric("Count of Mains Failure", f"{daily_metrics.get('mains_failure', 0):,}")
+            dm4.metric("Count of NCE Transmission Alarm Sites", f"{daily_metrics.get('nce_transmission', 0):,}")
+
+            down_summary = daily_report['down_sites_summary']
+            if down_summary.empty:
+                st.success(f"No sites recorded as down on {daily_date}.")
+            else:
+                daily_search = st.text_input("Filter by Site contains...", "", key="daily_noc_search")
+                down_filtered = down_summary[down_summary['Site Name'].astype(str).str.contains(
+                    daily_search, case=False, na=False)] if daily_search else down_summary
+                st.dataframe(down_filtered, width='stretch', hide_index=True, height=400)
+                render_word_export_button(
+                    "Daily NOC Alarm Analysis", [("Down Sites", down_filtered)],
+                    key_prefix="daily_noc_alarm", subtitle=str(daily_date),
+                )
+
+            daily_tabs = st.tabs(["🔋 NetEco Alarms (this day)", "📡 NCE Alarms (this day)"])
+            with daily_tabs[0]:
+                ne = daily_report['neteco_alarms']
+                if ne.empty:
+                    st.info("No NetEco alarm data for this date.")
+                else:
+                    st.dataframe(ne, width='stretch', hide_index=True, height=350)
+            with daily_tabs[1]:
+                nc = daily_report['nce_alarms']
+                if nc.empty:
+                    st.info("No NCE alarm data for this date.")
+                else:
+                    st.dataframe(nc, width='stretch', hide_index=True, height=350)
+
+# ============================================================
+# 📱 CEM — SmartCare Customer Experience Management: app traffic/TCP
+# quality + weekly Device Penetration mix. The CEM half now runs from this
+# project's own scrapers/smartcare_cem_scraper.py + reports/
+# run_smartcare_analysis_task.py (weekly, on-demand - see run_smartcare_
+# pipeline.bat); Device Mix still reads a sibling suite's weekly export -
+# see backend/smartcare_cem_processor.py and backend/device_penetration_processor.py
+# ============================================================
+elif section == "📱 CEM":
+    st.caption("Network-wide subscriber experience data from the SmartCare portal (DPI probe traffic mix, "
+               "TCP-level connection quality, and device model mix) - a different data source than the "
+               "counter-based KPIs elsewhere in this dashboard, refreshed weekly. No per-site breakdown is "
+               "available.")
+
+    sec_tabs = st.tabs(["📶 App Traffic & Quality", "📱 Device Mix"])
+
+    with sec_tabs[0]:
+        cem_overview = cached_cem_overview()
+        if not cem_overview.get('loaded'):
+            st.info("No SmartCare CEM data found. Run run_smartcare_pipeline.bat (or wait for its weekly "
+                    "scheduled run) to produce Comprehensive_Analysis_Historical.xlsx.")
+        else:
+            if cem_overview.get('is_stale'):
+                st.warning(f"⚠️ SmartCare CEM data is {cem_overview['age_days']:.1f} days old — this refreshes "
+                           f"weekly upstream, so a gap this large means a scheduled run was likely missed.")
+            else:
+                st.caption(f"Updated {cem_overview['age_days']:.1f} day(s) ago")
+
+            metrics_df = cem_overview['metrics']
+            top100 = cem_overview['top100_per_day']
+            top10_week = cem_overview['top10_per_week']
+
+            if not metrics_df.empty:
+                latest = metrics_df.iloc[-1]
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("TCP Connection Success Rate", f"{latest['tcp_connection_success_rate']:.3f}%"
+                          if 'tcp_connection_success_rate' in latest else "N/A")
+                m2.metric("Success Rate (incl. RST)", f"{latest['tcp_connection_success_rate_included_rst']:.3f}%"
+                          if 'tcp_connection_success_rate_included_rst' in latest else "N/A")
+                m3.metric("DL TCP Retransmission Rate", f"{latest['downlink_tcp_retransmission_rate']:.2f}%"
+                          if 'downlink_tcp_retransmission_rate' in latest else "N/A")
+                m4.metric("Avg TCP Packet Loss Rate", f"{latest['average_tcp_packet_loss_rate']:.2f}%"
+                          if 'average_tcp_packet_loss_rate' in latest else "N/A")
+                m5.metric("Total Traffic (GB)", f"{latest['total_traffic_gb']:,.0f}"
+                          if 'total_traffic_gb' in latest else "N/A")
+                st.caption(f"As of {latest['date']} — {len(metrics_df)} day(s) of history available" if 'date' in latest else "")
+
+                qc1, qc2 = st.columns(2)
+                with qc1:
+                    st.subheader("📈 Connection Success Rate Trend")
+                    st.caption("Zoomed to the observed range - a flat 0-100% axis would hide real day-to-day movement this close to 100%.")
+                    if 'tcp_connection_success_rate' in metrics_df.columns:
+                        succ_fig = go.Figure()
+                        succ_fig.add_trace(go.Scatter(x=metrics_df['date'], y=metrics_df['tcp_connection_success_rate'],
+                                                       mode='lines+markers', name='Success Rate', line=dict(color='#2ca02c')))
+                        if 'tcp_connection_success_rate_included_rst' in metrics_df.columns:
+                            succ_fig.add_trace(go.Scatter(x=metrics_df['date'], y=metrics_df['tcp_connection_success_rate_included_rst'],
+                                                           mode='lines', name='Incl. RST', line=dict(color='#98df8a', dash='dot')))
+                        lo = metrics_df['tcp_connection_success_rate'].min()
+                        hi = metrics_df['tcp_connection_success_rate'].max()
+                        pad = max((hi - lo) * 0.15, 0.01)
+                        succ_fig.update_layout(height=320, margin=dict(l=30, r=20, t=10, b=30), hovermode='x unified',
+                                                yaxis=dict(range=[lo - pad, hi + pad], ticksuffix='%'),
+                                                legend=dict(orientation='h', y=-0.3))
+                        st.plotly_chart(succ_fig, width='stretch', key='cem_success_trend')
+                    else:
+                        st.info("No connection success rate data available.")
+
+                with qc2:
+                    st.subheader("📉 Retransmission & Packet Loss Trend")
+                    st.caption("Same 0-4%-ish scale, so these three are comparable on one chart.")
+                    loss_cols = {
+                        'downlink_tcp_retransmission_rate': 'DL Retransmission Rate',
+                        'average_tcp_packet_loss_rate': 'Avg Packet Loss Rate',
+                        'downlink_tcp_packet_loss_rate': 'DL Packet Loss Rate',
+                    }
+                    present = {c: label for c, label in loss_cols.items() if c in metrics_df.columns}
+                    if present:
+                        loss_fig = go.Figure()
+                        for col, label in present.items():
+                            loss_fig.add_trace(go.Scatter(x=metrics_df['date'], y=metrics_df[col], mode='lines+markers', name=label))
+                        loss_fig.update_layout(height=320, margin=dict(l=30, r=20, t=10, b=30), hovermode='x unified',
+                                                yaxis=dict(ticksuffix='%'), legend=dict(orientation='h', y=-0.3))
+                        st.plotly_chart(loss_fig, width='stretch', key='cem_loss_trend')
+                    else:
+                        st.info("No retransmission/packet loss data available.")
+
+                st.subheader("📦 Total Traffic Volume Trend")
+                if 'total_traffic_gb' in metrics_df.columns:
+                    vol_fig = go.Figure(go.Scatter(x=metrics_df['date'], y=metrics_df['total_traffic_gb'],
+                                                    mode='lines', fill='tozeroy', line=dict(color='#1f77b4')))
+                    vol_fig.update_layout(height=280, margin=dict(l=30, r=20, t=10, b=30),
+                                           yaxis_title='Traffic (GB)', hovermode='x unified')
+                    st.plotly_chart(vol_fig, width='stretch', key='cem_volume_trend')
+                else:
+                    st.info("No traffic volume data available.")
+            else:
+                st.info("No daily metrics data available.")
+
+            st.subheader("📶 Top Applications by Traffic (Daily)")
+            if not top100.empty and 'date' in top100.columns:
+                cem_dates = sorted(top100['date'].astype(str).unique(), reverse=True)
+                cem_date_choice = st.selectbox("Date", cem_dates, key="cem_app_date")
+                top_n = smartcare_cem.top_apps_for_date(top100, cem_date_choice, n=15)
+                if top_n.empty:
+                    st.info("No application traffic data for this date.")
+                else:
+                    day_total = top100.loc[top100['date'].astype(str) == cem_date_choice, 'total_traffic_gb'].sum()
+                    top_n = top_n.assign(**{'% of Day Total': (top_n['total_traffic_gb'] / day_total * 100).round(1)}) if day_total else top_n
+                    bar_fig = go.Figure(go.Bar(x=top_n['total_traffic_gb'], y=top_n['application'], orientation='h',
+                                                text=top_n.get('% of Day Total'),
+                                                texttemplate='%{text}%' if '% of Day Total' in top_n.columns else None))
+                    bar_fig.update_layout(height=420, margin=dict(l=120, r=20, t=20, b=30),
+                                           yaxis=dict(autorange='reversed'), xaxis_title='Traffic (GB)')
+                    st.plotly_chart(bar_fig, width='stretch', key='cem_top_apps_chart')
+                    st.dataframe(top_n, width='stretch', hide_index=True)
+            else:
+                st.info("No application traffic data available.")
+
+            st.subheader("🗓️ Top Applications Trend (Weekly)")
+            if not top10_week.empty and 'week' in top10_week.columns:
+                latest_week = top10_week['week'].max()
+                top_apps_latest = (top10_week[top10_week['week'] == latest_week]
+                                    .nlargest(6, 'total_traffic_gb')['application'].tolist())
+                week_fig = go.Figure()
+                for app in top_apps_latest:
+                    app_trend = top10_week[top10_week['application'] == app].sort_values('week')
+                    week_fig.add_trace(go.Scatter(x=app_trend['week'], y=app_trend['total_traffic_gb'],
+                                                   mode='lines+markers', name=app))
+                week_fig.update_layout(height=350, margin=dict(l=30, r=20, t=10, b=30), hovermode='x unified',
+                                        yaxis_title='Traffic (GB)', legend=dict(orientation='h', y=-0.3),
+                                        xaxis_title='Week starting')
+                st.plotly_chart(week_fig, width='stretch', key='cem_weekly_apps_trend')
+                st.caption(f"Top 6 applications from the week of {latest_week}, tracked across all available weeks.")
+            else:
+                st.info("No weekly application traffic data available.")
+
+    with sec_tabs[1]:
+        dp_overview = cached_device_penetration_overview()
+        if not dp_overview.get('loaded'):
+            st.info("No Device Penetration data found. This tab reads the output of a separate NOC "
+                    "automation suite's weekly Device Penetration export when it's installed and running "
+                    "on this machine.")
+        else:
+            if dp_overview.get('is_stale'):
+                st.warning(f"⚠️ Device Penetration data is {dp_overview['age_days']:.1f} days old — this "
+                           f"refreshes weekly upstream, so a gap this large means a scheduled run was likely missed.")
+            else:
+                st.caption(f"Updated {dp_overview['age_days']:.1f} day(s) ago")
+
+            snap = dp_overview['latest_snapshot']
+            st.caption(f"Snapshot: {dp_overview['latest_time']} — {len(snap):,} device models")
+
+            if 'Broadband Capable' in snap.columns and 'Number of Users(count)' in snap.columns:
+                total_users = snap['Number of Users(count)'].sum()
+                broadband_users = snap.loc[snap['Broadband Capable'], 'Number of Users(count)'].sum()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Devices Seen", f"{total_users:,.0f}")
+                m2.metric("LTE/NR-Capable", f"{100 * broadband_users / total_users:.1f}%" if total_users else "N/A")
+                m3.metric("Legacy-Only (2G/3G)", f"{100 * (1 - broadband_users / total_users):.1f}%" if total_users else "N/A")
+                st.caption("A high legacy-only share is context for capacity planning: even an idle new LTE "
+                           "band gets little uptake at a site until subscriber devices there catch up.")
+
+            c1, c2 = st.columns(2)
+            if 'Device Type' in snap.columns and 'Number of Users(count)' in snap.columns:
+                with c1:
+                    st.subheader("📱 By Device Type")
+                    type_totals = snap.groupby('Device Type')['Number of Users(count)'].sum().sort_values(ascending=False)
+                    fig_type = go.Figure(go.Bar(x=type_totals.values, y=type_totals.index, orientation='h'))
+                    fig_type.update_layout(height=350, margin=dict(l=120, r=20, t=20, b=30),
+                                            yaxis=dict(autorange='reversed'), xaxis_title='Users')
+                    st.plotly_chart(fig_type, width='stretch', key='dp_type_chart')
+            if 'Device Brand' in snap.columns and 'Number of Users(count)' in snap.columns:
+                with c2:
+                    st.subheader("🏷️ Top Brands")
+                    brand_totals = snap.groupby('Device Brand')['Number of Users(count)'].sum().sort_values(ascending=False).head(10)
+                    fig_brand = go.Figure(go.Bar(x=brand_totals.values, y=brand_totals.index, orientation='h'))
+                    fig_brand.update_layout(height=350, margin=dict(l=120, r=20, t=20, b=30),
+                                             yaxis=dict(autorange='reversed'), xaxis_title='Users')
+                    st.plotly_chart(fig_brand, width='stretch', key='dp_brand_chart')
+
+            dp_search = st.text_input("Filter by Device Model contains...", "", key="dp_search")
+            dp_filtered = snap
+            if dp_search and 'Device Model' in dp_filtered.columns:
+                dp_filtered = dp_filtered[dp_filtered['Device Model'].astype(str).str.contains(dp_search, case=False, na=False)]
+            st.dataframe(
+                dp_filtered.sort_values('Number of Users(count)', ascending=False) if 'Number of Users(count)' in dp_filtered.columns else dp_filtered,
+                width='stretch', hide_index=True, height=400,
+            )
+
+# ============================================================
 # 🔎 INVESTIGATE — Cell Explorer, Special Reports
 # ============================================================
 elif section == "🔎 Investigate":
@@ -709,6 +1332,9 @@ elif section == "🔎 Investigate":
                     combined = filtered[filtered[name_col].isin(selected)]
                     st.dataframe(combined, width='stretch', hide_index=True)
 
+                    if pick_col == site_col:
+                        render_site_detail_and_advice(picked, explore_date, key_prefix="ce")
+
                     sel_tuple = tuple(selected)
                     failing = cached_cell_failing(explore_tech, sel_tuple, explore_date)
                     st.subheader("⚠️ Failing KPIs & Suggested Fixes")
@@ -773,8 +1399,11 @@ elif section == "🔎 Investigate":
                 index=1 if sr_has_site_col else 0, disabled=not sr_has_site_col,
             )
             sr_pick_col = sr_site_col if (sr_group_mode == "Site" and sr_has_site_col) else 'Cell Name'
+            sr_search = st.text_input("Filter by Cell Name / Site Name contains...", "", key="sr_search")
             sr_options = sorted(sr_raw[sr_pick_col].dropna().astype(str).unique().tolist()) \
                 if sr_pick_col in sr_raw.columns else []
+            if sr_search:
+                sr_options = [o for o in sr_options if sr_search.lower() in o.lower()]
             sr_picked = st.multiselect(
                 f"Select one or more {sr_pick_col.lower()}s (e.g. BGZ001, BGZ002...)",
                 options=sr_options, key="sr_select",
@@ -812,6 +1441,9 @@ elif section == "🔎 Investigate":
                         st.subheader(f"📋 Combined KPIs — {latest_date}")
                         st.dataframe(sr_trend[sr_trend['Date'] == latest_date].drop(columns=['Date']),
                                      width='stretch', hide_index=True)
+
+                        if sr_pick_col == sr_site_col:
+                            render_site_detail_and_advice(sr_picked, latest_date, key_prefix="sr")
 
                         st.subheader("⚠️ Failing KPIs & Suggested Fixes")
                         sr_failing = cached_cell_failing(sr_tech, tuple(sr_cells), latest_date)
@@ -856,7 +1488,7 @@ elif section == "🔎 Investigate":
 # time as they come up.
 # ============================================================
 elif section == "📋 HQ Reports":
-    sec_tabs = st.tabs(["📄 NQ Data Collection Template"])
+    sec_tabs = st.tabs(["📄 NQ Data Collection Template", "🌐 Traffic & Availability (Tripoli HQ)"])
 
     with sec_tabs[0]:
         st.caption("EAST branch only, built from output/csv/ history. Not included yet: "
@@ -892,6 +1524,81 @@ elif section == "📋 HQ Reports":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
         st.caption("Download only for now — upload to SharePoint manually until auto-upload is set up.")
+
+    with sec_tabs[1]:
+        import calendar as _calendar
+
+        st.caption(
+            "EAST branch only. Mirrors Sheet1 of config/Traffic and network availability "
+            "Needed from Tripoli HQ.xlsx — Sum of 4G PS Traffic, Sum of Gi Interface Traffic "
+            "Volume, Average DL PRB Utilization, Average 2G Network Availability, and Average "
+            "DL Throughput per User, one row per calendar month. Already-filled months are "
+            "read straight from that file; pick a month below and click Compute to fill in "
+            "the newest one from the pipeline's own output/csv/ history — needed once a "
+            "month, after that month ends."
+        )
+
+        target_dt = pd.to_datetime(target_date)
+        default_month = target_dt.month - 1 or 12
+        default_year = target_dt.year if target_dt.month > 1 else target_dt.year - 1
+
+        pc1, pc2, pc3 = st.columns([1, 2, 2])
+        with pc1:
+            sel_year = int(st.number_input("Year", value=default_year, step=1, format="%d"))
+        with pc2:
+            sel_month = st.selectbox(
+                "Month", list(range(1, 13)), index=default_month - 1,
+                format_func=lambda m: _calendar.month_name[m],
+            )
+        with pc3:
+            st.write("")
+            st.write("")
+            compute_clicked = st.button(
+                f"🔄 Compute & Save {_calendar.month_name[sel_month]} {sel_year}", width='stretch',
+            )
+
+        if compute_clicked:
+            computed = compute_hq_traffic_month('output/csv', sel_year, sel_month)
+            missing = [f for f in HQ_TRAFFIC_METRICS if computed.get(f) is None]
+            if len(missing) == len(HQ_TRAFFIC_METRICS):
+                st.warning(
+                    f"No pipeline data found for {_calendar.month_name[sel_month]} {sel_year} "
+                    "in output/csv/ — nothing to save."
+                )
+            else:
+                save_hq_traffic_month(computed)
+                st.cache_data.clear()
+                if missing:
+                    st.warning(f"Saved, but no source data yet for: {', '.join(missing)}.")
+                for src, (have, total) in computed['coverage'].items():
+                    if have < total:
+                        st.info(
+                            f"⚠️ {src}: only {have}/{total} day(s) of the month were in "
+                            "output/csv/ — this month's figure is based on a partial month."
+                        )
+                st.success(f"Saved {_calendar.month_name[sel_month]} {sel_year} to the Tripoli HQ template.")
+                st.rerun()
+
+        st.divider()
+        history_df = cached_hq_traffic_history()
+        if not history_df.empty:
+            display_df = history_df.copy()
+            display_df['Month'] = display_df['Month'].apply(lambda m: _calendar.month_name[int(m)])
+            st.dataframe(display_df, width='stretch', hide_index=True)
+            st.caption(f"{len(display_df)} month(s) on file.")
+        else:
+            st.info("No months saved yet.")
+
+        st.divider()
+        if os.path.exists(HQ_TRAFFIC_TEMPLATE_FILE):
+            with open(HQ_TRAFFIC_TEMPLATE_FILE, 'rb') as f:
+                st.download_button(
+                    "⬇️ Download Traffic & Availability Report (.xlsx)", data=f.read(),
+                    file_name="Traffic and network availability Needed from Tripoli HQ.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width='stretch',
+                )
+        st.caption("Download and send to Tripoli HQ manually.")
 
 # ============================================================
 # 📧 REPORTS — network summary + copy-paste text + Word/Excel export
@@ -941,6 +1648,6 @@ elif section == "📧 Reports":
         email_text = rg.generate_email_text(
             target_date, previous_date, health, bundle['scorecards'], bundle['worst_cells'],
             bundle['site_health'], bundle['topology'], bundle['traffic'],
-            bundle['site_inventory'], bundle['freshness'], bundle['trend'],
+            bundle['site_inventory'], bundle['freshness'], bundle['trend'], bundle['alarm_report'],
         )
         st.text_area("Report text", email_text, height=500)
