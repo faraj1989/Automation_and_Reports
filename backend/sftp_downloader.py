@@ -118,12 +118,20 @@ class SFTPDownloader:
         # Remove extension
         name = filename.rsplit('.', 1)[0]
 
-        # Remove timestamp suffix (_YYYYMMDDHHMMSS-YYYYMMDDHHMMSS)
-        pattern = r'(_\d{14}-\d{14})$'
-        name = re.sub(pattern, '', name)
-
-        # Remove _YYYYMMDD suffix (for files like "CS Roaming users_20260813")
-        pattern = r'(_\d{8})$'
+        # Remove a trailing timestamp suffix: _YYYYMMDDHHMMSS-YYYYMMDDHHMMSS,
+        # a lone _YYYYMMDD, or anything in between - confirmed live
+        # 2026-09-13 that the weekly interference report's own first half is
+        # truncated to 7 digits ("_2026090-20260913052430"), not the full 14
+        # every other report uses, so a rigid {14}/{8}-only match silently
+        # left its timestamp attached to the "base name" forever. That made
+        # every week's file a permanently-unique base name to
+        # cleanup_old_remote_duplicates(), which never once fired for this
+        # report - each week's ~40-57MB file just accumulated on the SFTP
+        # server instead of the newest one replacing the last. 6-14 digits
+        # per side comfortably covers every real timestamp width seen
+        # (YYYYMM through YYYYMMDDHHMMSS) without risking a false match on
+        # a report name that happens to end in a short, non-date number.
+        pattern = r'(_\d{6,14}(-\d{6,14})?)$'
         name = re.sub(pattern, '', name)
 
         # Remove trailing underscores and spaces

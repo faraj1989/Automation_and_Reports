@@ -30,6 +30,7 @@ from backend.special_reports_processor import (
 )
 from backend.topology_processor import build_site_topology_csv, find_topology_xlsx
 from backend import smartcare_cem_processor as smartcare_cem
+from backend import complaint_analyzer
 
 st.set_page_config(page_title="Libyana Network Dashboard", page_icon="📊", layout="wide")
 
@@ -193,6 +194,14 @@ def cached_cem_overview():
 @st.cache_data(ttl=3600)
 def cached_device_penetration_overview():
     return rg.build_device_penetration_overview()
+
+
+# EPT (coordinates/azimuth) only changes when the RF team hand-edits the
+# workbook - an hour's cache avoids re-parsing all 3 sheets (~15k rows) on
+# every complaint lookup within a session.
+@st.cache_data(ttl=3600)
+def cached_ept_cells():
+    return complaint_analyzer.load_all_ept_cells()
 
 
 def render_site_detail_and_advice(site_names, target_date, key_prefix):
@@ -499,7 +508,7 @@ with st.sidebar:
     section = st.radio(
         "Section",
         ["📊 Overview", "📡 KPIs & Performance", "🏗️ Sites & Infrastructure",
-         "📶 Packet Loss", "🚨 Alarms", "📱 CEM", "🔎 Investigate",
+         "📶 Packet Loss", "🚨 Alarms", "📱 CEM", "📞 User Complaint", "🔎 Investigate",
          "📋 HQ Reports", "📧 Reports"],
         key="nav_section", label_visibility="collapsed",
     )
@@ -1259,6 +1268,158 @@ elif section == "📱 CEM":
             st.dataframe(
                 dp_filtered.sort_values('Number of Users(count)', ascending=False) if 'Number of Users(count)' in dp_filtered.columns else dp_filtered,
                 width='stretch', hide_index=True, height=400,
+            )
+
+# ============================================================
+# 📞 USER COMPLAINT — coordinate-based coverage complaint analysis
+# (backend/complaint_analyzer.py: EPT-based serving-cell matching, reusing
+# the same KPI-threshold/alarm machinery as the rest of this dashboard)
+# ============================================================
+elif section == "📞 User Complaint":
+    st.caption("Match a complainant's coordinates to their likely serving cell(s) - or every cell in an "
+               "area - then check those cells' KPIs and alarm history against the same thresholds the rest "
+               "of this dashboard uses. Serving-cell matching from coordinates alone is approximate (no "
+               "terrain, indoor/outdoor, or live signal data), so treat ranked candidates as an "
+               "investigation starting point, not a guaranteed answer.")
+
+    complaint_mode = st.radio("Complaint type", ["📍 Specific user", "⭕ Whole area"],
+                               horizontal=True, key="cpl_mode")
+
+    with st.form("cpl_form"):
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            cpl_name = st.text_input("Complainant name", key="cpl_name")
+        with cc2:
+            cpl_phone = st.text_input("Phone number", key="cpl_phone")
+        cc3, cc4 = st.columns(2)
+        with cc3:
+            cpl_date = st.date_input("Complaint date", value=pd.Timestamp.now().normalize() - pd.Timedelta(days=1),
+                                      key="cpl_date")
+        with cc4:
+            cpl_reason = st.selectbox("Complaint reason", ["No Signal / No Coverage", "Call Drop",
+                                                             "Weak Signal", "Slow Data / Poor Throughput",
+                                                             "Poor Voice Quality", "Other"], key="cpl_reason")
+
+        paste = st.text_input("Paste coordinates as \"lat, lon\" (from Google Maps, optional shortcut)",
+                               key="cpl_paste", placeholder="e.g. 31.86520, 23.92030")
+        paste_lat, paste_lon = None, None
+        if paste and ',' in paste:
+            try:
+                paste_lat, paste_lon = (float(x.strip()) for x in paste.split(',')[:2])
+            except ValueError:
+                st.warning("Couldn't parse that as \"lat, lon\" - using the fields below instead.")
+
+        loc1, loc2, loc3 = st.columns(3)
+        with loc1:
+            cpl_lat = st.number_input("Latitude", value=paste_lat if paste_lat is not None else 32.0,
+                                       format="%.6f", key="cpl_lat")
+        with loc2:
+            cpl_lon = st.number_input("Longitude", value=paste_lon if paste_lon is not None else 20.0,
+                                       format="%.6f", key="cpl_lon")
+        with loc3:
+            if complaint_mode == "⭕ Whole area":
+                cpl_radius_m = st.number_input("Search radius (meters)", min_value=50, max_value=10000,
+                                                value=600, step=50, key="cpl_radius_m")
+            else:
+                cpl_wedge = st.number_input("Azimuth match tolerance (± degrees)", min_value=15, max_value=90,
+                                             value=complaint_analyzer.DEFAULT_WEDGE_HALF_DEG, key="cpl_wedge")
+
+        cpl_submitted = st.form_submit_button("🔍 Find cells")
+
+    if cpl_submitted:
+        ept_cells = cached_ept_cells()
+        st.session_state['cpl_complainant'] = {
+            'Name': cpl_name, 'Phone': cpl_phone, 'Date': str(cpl_date), 'Reason': cpl_reason,
+            'Latitude': cpl_lat, 'Longitude': cpl_lon,
+        }
+        st.session_state['cpl_active_mode'] = complaint_mode
+        st.session_state['cpl_center'] = (cpl_lat, cpl_lon)
+        if complaint_mode == "⭕ Whole area":
+            radius_km = cpl_radius_m / 1000.0
+            found = complaint_analyzer.find_cells_in_area(cpl_lat, cpl_lon, radius_km, ept_cells=ept_cells)
+            st.session_state['cpl_radius_km'] = radius_km
+            found = found.assign(Include=True) if not found.empty else found
+        else:
+            found = complaint_analyzer.find_serving_cells(cpl_lat, cpl_lon, ept_cells=ept_cells,
+                                                            wedge_half_deg=cpl_wedge)
+            st.session_state['cpl_radius_km'] = None
+            found = found.assign(Include=found['Rank'] == 1) if not found.empty else found
+        st.session_state['cpl_found'] = found
+        st.session_state.pop('cpl_analysis', None)
+
+    found = st.session_state.get('cpl_found')
+    if found is not None:
+        center = st.session_state['cpl_center']
+        radius_km = st.session_state.get('cpl_radius_km')
+        mode = st.session_state['cpl_active_mode']
+
+        if found.empty:
+            st.warning("No active cells matched this location" +
+                       (f" within {radius_km*1000:.0f} m." if radius_km else
+                        " within any cell's coverage wedge - try widening the azimuth tolerance."))
+        else:
+            st.subheader("🗺️ Map")
+            highlight_idx = found[found.get('Include', False)].index.tolist() if mode == "📍 Specific user" else []
+            fig = complaint_analyzer.build_complaint_map(found, center=center, radius_km=radius_km,
+                                                          highlight_index=highlight_idx)
+            st.plotly_chart(fig, width='stretch')
+
+            st.subheader("📡 Cells found — select which to include in the analysis")
+            display_cols = ['Include', 'Technology', 'Cell Name', 'Site Name', 'Distance (km)',
+                             'Azimuth', 'Azimuth Diff', 'Radius (km)']
+            if mode == "📍 Specific user":
+                display_cols.insert(1, 'Rank')
+            display_cols = [c for c in display_cols if c in found.columns]
+            edited = st.data_editor(
+                found[display_cols], width='stretch', hide_index=True, key="cpl_editor",
+                disabled=[c for c in display_cols if c != 'Include'],
+                column_config={"Include": st.column_config.CheckboxColumn(required=True)},
+            )
+
+            if st.button("📊 Analyze selected cells", key="cpl_analyze_btn"):
+                selected = found.loc[edited[edited['Include']].index]
+                if selected.empty:
+                    st.warning("Select at least one cell to analyze.")
+                else:
+                    with st.spinner("Checking KPIs, alarms, and interference for the selected cells..."):
+                        analysis = complaint_analyzer.build_complaint_analysis(
+                            rg, selected, str(st.session_state['cpl_complainant']['Date']), lookback_days=7)
+                    st.session_state['cpl_analysis'] = analysis
+
+        analysis = st.session_state.get('cpl_analysis')
+        if analysis:
+            st.divider()
+            st.subheader("🧾 Findings")
+            for line in analysis['narratives']:
+                st.markdown(f"- {line}")
+            if not analysis['narratives']:
+                st.info("No findings to report for the selected cells.")
+
+            find_tabs = st.tabs(["⚠️ Failing KPIs", "🚨 Alarm History", "📶 Interference (2G)"])
+            with find_tabs[0]:
+                if analysis['failing_kpis'].empty:
+                    st.success("No KPI threshold breaches on the complaint date for the selected cells.")
+                else:
+                    st.dataframe(analysis['failing_kpis'], width='stretch', hide_index=True)
+            with find_tabs[1]:
+                if analysis['alarms'].empty:
+                    st.success("No NE Is Disconnected events found for the selected sites in the lookback window.")
+                else:
+                    st.dataframe(analysis['alarms'], width='stretch', hide_index=True)
+            with find_tabs[2]:
+                if analysis['interference'].empty:
+                    st.info("No 2G interference data for the selected cells in this window.")
+                else:
+                    st.dataframe(analysis['interference'], width='stretch', hide_index=True)
+
+            report_bytes = complaint_analyzer.generate_complaint_word_report(
+                rg, st.session_state['cpl_complainant'], mode, analysis)
+            st.download_button(
+                "📄 Generate complaint report (Word)", data=report_bytes,
+                file_name=f"Complaint_Report_{st.session_state['cpl_complainant']['Name'] or 'unnamed'}_"
+                          f"{st.session_state['cpl_complainant']['Date']}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="cpl_word_dl",
             )
 
 # ============================================================
