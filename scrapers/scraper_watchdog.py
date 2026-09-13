@@ -16,6 +16,8 @@ the password that failed, so fixing MAE_PASSWORD/NETECO_PASSWORD/
 NCE_PASSWORD in .env unblocks it on the very next check (no need to wait
 for a new calendar day, and no risk of hammering a portal's login page
 with a password already known to be wrong)."""
+
+
 import os
 import subprocess
 import sys

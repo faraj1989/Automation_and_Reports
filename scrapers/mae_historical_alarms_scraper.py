@@ -110,19 +110,41 @@ def print_driver_versions():
     print(f"ChromeDriver version: {chromedriver_version}")
 
 
-chrome_options = Options()
-chrome_options.add_argument("--ignore-certificate-errors")
-chrome_options.add_argument("--headless=new")
-chrome_options.add_argument("--window-size=1920,1080")
-chrome_options.add_experimental_option("prefs", {
-    "download.default_directory": DOWNLOAD_DIR,
-    "download.prompt_for_download": False,
-})
+def create_driver():
+    options = Options()
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
+    options.add_experimental_option("prefs", {
+        "download.default_directory": DOWNLOAD_DIR,
+        "download.prompt_for_download": False,
+    })
+    new_service = Service(ChromeDriverManager().install())
+    new_driver = webdriver.Chrome(service=new_service, options=options)
+    print(f"Using ChromeDriver at: {new_service.path}")
+    return new_driver
+
+
+def is_dead_session_error(exc):
+    """True when the whole browser/chromedriver process is gone (its session
+    port refuses connections) rather than a page-level hiccup - same fix as
+    nce_active_alarms_scraper.py / nce_historical_alarms_scraper.py, confirmed
+    live 2026-09-13 for this exact scraper: it looped an identical "invalid
+    session id" failure every 5-minute cycle for hours with no recovery,
+    since retrying selenium calls against a dead session can never succeed
+    on its own."""
+    message = str(exc)
+    return (
+        "actively refused" in message
+        or "Max retries exceeded" in message
+        or "invalid session id" in message.lower()
+        or "session deleted" in message.lower()
+        or "chrome not reachable" in message.lower()
+    )
+
 
 print("Initializing ChromeDriver...")
-service = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=service, options=chrome_options)
-print(f"Using ChromeDriver at: {service.path}")
+driver = create_driver()
 print_driver_versions()
 
 
@@ -294,6 +316,7 @@ def save_error_screenshot(label):
 
 
 def main():
+    global driver
     try:
         login()
         print("Locating Export button (searching frames)...")
@@ -321,7 +344,24 @@ def main():
                 raise  # let the outer handler stop the script for today instead of retrying forever
             except Exception as e:
                 print(f"[{time.strftime('%H:%M:%S')}] Export cycle failed: {e}")
-                save_error_screenshot("cycle_error")
+                if is_dead_session_error(e):
+                    print("Browser/ChromeDriver process appears to have died - restarting the browser...")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    try:
+                        driver = create_driver()
+                        print_driver_versions()
+                        login()
+                        if not find_frame_with_export():
+                            print("Could not find the Export button after browser restart; will retry next cycle.")
+                    except LoginFailedError:
+                        raise
+                    except Exception as restart_error:
+                        print(f"Browser restart failed: {restart_error}")
+                else:
+                    save_error_screenshot("cycle_error")
 
             time.sleep(INTERVAL_SECONDS)
     except KeyboardInterrupt:
