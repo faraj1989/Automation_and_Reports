@@ -171,6 +171,18 @@ FRESHNESS_FILES = {
     'Gi_Interface_Traffic': 'Date',
 }
 
+# Gi Interface Traffic's own raw Huawei export has a built-in extra day of
+# generation lag baked into the report itself - confirmed by inspecting the
+# raw CSVs directly: the file downloaded on day D only ever contains
+# finalized rows through D-2, one day later than every other daily KPI
+# report here (which are current through D-1). So it will always show
+# lag=1 relative to target_date under normal operation - not a pipeline
+# problem, just this one report's baseline cadence - hence the +1 allowance
+# below so it reads Current instead of permanently crying wolf.
+FRESHNESS_EXPECTED_LAG = {
+    'Gi_Interface_Traffic': 1,
+}
+
 CELL_SHEETS = {'GSM': '2G_Cell_CSBH', 'UMTS': '3G_Cell_CSBH', 'LTE': '4G_Cell_BH'}
 
 # The "site" grouping column is named differently per technology's cell
@@ -775,7 +787,7 @@ class ReportGenerator:
             if pd.isna(latest):
                 rows.append({'File': name, 'Latest Date': 'N/A', 'Status': '🔴 Missing'})
                 continue
-            lag = (target_dt - latest).days
+            lag = (target_dt - latest).days - FRESHNESS_EXPECTED_LAG.get(name, 0)
             if lag <= 0:
                 status = '🟢 Current'
             elif lag == 1:

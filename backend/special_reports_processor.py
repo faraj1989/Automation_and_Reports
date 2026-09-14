@@ -670,15 +670,165 @@ def save_hq_traffic_month(computed: dict, path=HQ_TRAFFIC_TEMPLATE_FILE) -> None
     wb.save(path)
 
 
+def build_network_daily_kpis_report(csv_folder='output/csv') -> pd.DataFrame:
+    """Network Daily KPI's sheet, EAST branch only. The template also
+    carries North/South/Middle/West columns and ~14 "Libyana" (nationwide)
+    totals per KPI - this pipeline only ever has FTP/OSS access to the
+    East branch's own Huawei exports, so those columns are structurally
+    impossible to produce here and are intentionally left out (confirmed
+    with the user 2026-09-14: "we only use east area").
+
+    Column sourcing:
+    - PS Traffic (TB) per tech: 4G_NW_Daily (DL+UL Traffic Volume, matching
+      cell_info_report.py's own DL+UL convention - NOT the DL-only figure
+      Traffic_Network_4G.csv uses elsewhere in this dashboard, so this
+      column will read slightly higher than that one for the same dates),
+      3G_NW_Daily ('PS traffic (UL+DL)(GB)'), 2G_NW_Daily ('PS Traffic
+      (RLC)(MB)') - GB/MB converted to TB. "PS Traffic (TB)" is the sum of
+      the three.
+    - Gi Interface Traffic Volume (TB): Gi_Interface_Traffic.csv's own
+      'PS 234G traffic (TB)' - this file has a ~1-2 day reporting lag baked
+      into Huawei's own report generation (confirmed 2026-09-14; see
+      FRESHNESS_EXPECTED_LAG in report_generator.py), unrelated to this
+      pipeline, so this column will run behind the others here until the
+      user's upstream fix lands.
+    - VoLTE/3G/2G CS traffic and their "Voice Traffic (Erl)" sum: direct
+      NW_Daily columns, same counters cell_info_report.py already uses for
+      the equivalent per-tech traffic figures.
+    - Network Availability (%): 4G from 4G_NW_Daily's own dedicated
+      availability column. 3G from 3G_NWBH's 'Availability_all level' -
+      NOT 3G_NW_Daily/3G_NWBH's plain 'Availability' column, which despite
+      the name is some unrelated unbounded metric (checked directly:
+      consistently large negative values, not a 0-100 percentage at all).
+      2G uses 'RR307:TCH Availability(%)' as the primary metric per the
+      user's explicit 2026-09-14 direction (no dedicated "network
+      availability" counter exists for 2G in this export) - same counter
+      compute_hq_traffic_month() already uses for the Tripoli-HQ template.
+    - Maximum Number of RRC Connection Users: 4G_NW_Daily's
+      'L.Traffic.User.Max' (same counter as the Overview tab's "LTE
+      maximum attached users").
+    - DL/UL Throughput, DL/UL PRB, E-RAB/RRC Setup Success Rate: 4G_NWBH
+      (busy-hour), matching how these are used elsewhere in this project.
+    - E-RAB Drop Rate / RRC Drop Rate: counters the user added to the
+      Huawei export config 2026-09-14 ('E-RAB Drop Rate of QCI1(CMCC
+      Cell)-ZM' and 'RRC Drop Rate (%)') - not present in historical
+      exports yet, so these read all-NaN until a future pipeline run
+      picks them up. Checked in both 4G_NWBH and 4G_NW_Daily since which
+      report they land in isn't confirmed yet - if they still read NaN
+      once the user says fresh data has the new counters, check the other
+      raw report/sheet Huawei actually put them in.
+    - 3G/2G CSSR and CDR: 'Call Setup Success Rate(%)' (2G) / '..._EFD'
+      (3G) variants, 'TCH Drop Rate(%)' (2G) / 'CS Call Drop Rate(%)' (3G).
+    - Latency / Packet Loss Rate: Transmission_KPIs.csv's 'Avg Delay(ms)'/
+      'Avg Packet Loss(%)', averaged network-wide per day - that file is
+      per Site+Adjacent-Node, not already one row per day, so this is a
+      network-wide daily mean rather than a single dedicated counter.
+    - VoLTE Success Rate: 4G_NW_Daily's 'VoLTE Setup Success Rate-ZM(%)'.
+    """
+    def _load_dated(name):
+        df = _load_csv(csv_folder, name)
+        if df is None or 'Date' not in df.columns:
+            return None
+        df = df.copy()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
+        df = df.dropna(subset=['Date']).drop_duplicates(subset='Date', keep='last')
+        return df.set_index('Date')
+
+    nw2g = _load_dated('2G_NW_Daily')
+    nw3g = _load_dated('3G_NW_Daily')
+    nw4g = _load_dated('4G_NW_Daily')
+    bh3g = _load_dated('3G_NWBH')
+    bh4g = _load_dated('4G_NWBH')
+    gi = _load_dated('Gi_Interface_Traffic')
+
+    trans_daily = None
+    trans = _load_csv(csv_folder, 'Transmission_KPIs')
+    if trans is not None and 'Date' in trans.columns:
+        t = trans.copy()
+        t['Date'] = pd.to_datetime(t['Date'], errors='coerce').dt.normalize()
+        t = t.dropna(subset=['Date'])
+        trans_daily = t.groupby('Date')[['Avg Delay(ms)', 'Avg Packet Loss(%)']].mean()
+        trans_daily = trans_daily.rename(columns={
+            'Avg Delay(ms)': 'Latency (ms)', 'Avg Packet Loss(%)': 'Packet Loss Rate (%)',
+        })
+
+    frames = [df for df in (nw2g, nw3g, nw4g, bh3g, bh4g, gi, trans_daily) if df is not None]
+    if not frames:
+        return pd.DataFrame()
+    all_dates = sorted(set().union(*[df.index for df in frames]))
+    out = pd.DataFrame(index=pd.Index(all_dates, name='Date'))
+
+    def g(df, col):
+        if df is None or col not in df.columns:
+            return None
+        return pd.to_numeric(df[col], errors='coerce').reindex(out.index)
+
+    def g_any(*candidates):
+        for df, col in candidates:
+            s = g(df, col)
+            if s is not None:
+                return s
+        return pd.Series(float('nan'), index=out.index, dtype='float64')
+
+    traffic_4g_tb = (g(nw4g, 'DL Traffic  Volume(GB)') + g(nw4g, 'UL Traffic  Volume(GB)')) / 1024
+    traffic_3g_tb = g(nw3g, 'PS traffic (UL+DL)(GB)') / 1024
+    traffic_2g_tb = g(nw2g, 'PS Traffic (RLC)(MB)') / 1024 / 1024
+    out['4G PS Traffic (TB)'] = traffic_4g_tb
+    out['3G PS Traffic (TB)'] = traffic_3g_tb
+    out['2G PS Traffic (TB)'] = traffic_2g_tb
+    out['PS Traffic (TB)'] = traffic_4g_tb.add(traffic_3g_tb, fill_value=0).add(traffic_2g_tb, fill_value=0)
+
+    out['Gi Interface Traffic Volume (TB)'] = g(gi, 'PS 234G traffic (TB)')
+
+    volte_erl = g(nw4g, 'VoLTE Traffic Volume (Erl)')
+    cs3g_erl = g(nw3g, 'CS Traffic(Erl)')
+    cs2g_erl = g(nw2g, 'K3014:Traffic Volume on TCH(Erl)')
+    out['VoLTE Voice Traffic (Erl)'] = volte_erl
+    out['3G CS Traffic (Erl)'] = cs3g_erl
+    out['2G CS Traffic (Erl)'] = cs2g_erl
+    out['Voice Traffic (Erl)'] = volte_erl.add(cs3g_erl, fill_value=0).add(cs2g_erl, fill_value=0)
+
+    out['4G Network Availability (%)'] = g(nw4g, 'Radio Network Availability Rate(%)')
+    out['3G Network Availability (%)'] = g(bh3g, 'Availability_all level')
+    out['2G Network Availability (%)'] = g(nw2g, 'RR307:TCH Availability(%)')
+
+    out['Maximum Number of RRC Connection Users'] = g(nw4g, 'L.Traffic.User.Max')
+    out['Average DL Throughput per User (Mbps)'] = g(bh4g, 'User Downlink Average Throughput (Mbps)')
+    out['Average UL Throughput per User (Mbps)'] = g(bh4g, 'User Uplink Average Throughput (Mbps)')
+    out['DL PRB Utilization Rate (%)'] = g(bh4g, 'DL PRB Utilizing Rate(%)')
+    out['UL PRB Utilization Rate (%)'] = g(bh4g, 'UL PRB Utilizing Rate(%)')
+    out['E-RAB Setup Success Rate (%)'] = g(bh4g, 'E-RAB Setup Success Rate')
+    out['RRC Setup Success Rate (%)'] = g(bh4g, 'RRC Setup Success Rate(%)')
+    out['E-RAB Drop Rate (%)'] = g_any(
+        (bh4g, 'E-RAB Drop Rate of QCI1(CMCC Cell)-ZM'), (nw4g, 'E-RAB Drop Rate of QCI1(CMCC Cell)-ZM'),
+    )
+    out['RRC Drop Rate (%)'] = g_any((bh4g, 'RRC Drop Rate (%)'), (nw4g, 'RRC Drop Rate (%)'))
+
+    out['3G CSSR (%)'] = g(nw3g, 'Call Setup Success Rate(%)_EFD')
+    out['2G CSSR (%)'] = g(nw2g, 'Call Setup Success Rate(%)')
+    out['3G CDR (%)'] = g(nw3g, 'CS Call Drop Rate(%)')
+    out['2G CDR (%)'] = g(nw2g, 'TCH Drop Rate(%)')
+
+    if trans_daily is not None:
+        out['Latency (ms)'] = trans_daily['Latency (ms)'].reindex(out.index)
+        out['Packet Loss Rate (%)'] = trans_daily['Packet Loss Rate (%)'].reindex(out.index)
+    else:
+        out['Latency (ms)'] = float('nan')
+        out['Packet Loss Rate (%)'] = float('nan')
+    out['VoLTE Success Rate (%)'] = g(nw4g, 'VoLTE Setup Success Rate-ZM(%)')
+
+    out.insert(0, 'Branch', BRANCH)
+    out = out.reset_index().sort_values('Date').reset_index(drop=True)
+    out['Date'] = out['Date'].dt.strftime('%Y-%m-%d')
+    return out
+
+
 def build_nq_template_report(csv_folder='output/csv', interference_period='month') -> dict:
-    """All currently-ready NQ Data Collection Template sheets, EAST only.
-    Network Daily KPI's still needs column-by-column source confirmation
-    for a few columns (Gi Interface is settled; E-RAB/RRC Drop Rate, Max
-    RRC Connection User, and Packet Loss Rate meaning are still open) and
-    isn't included yet."""
+    """All NQ Data Collection Template sheets, EAST only."""
     bh_4g = _load_csv(csv_folder, '4G_Cell_BH')
     return {
         'Subscribers': build_subscribers_report(csv_folder),
+        "Network Daily KPI's": build_network_daily_kpis_report(csv_folder),
         '4G Cell Prb Dl ut(%)': build_prb_bucket_report(csv_folder, df=bh_4g),
         'Cell Data': build_cell_data_report(csv_folder, df=bh_4g),
         'Cells with High DL PRB (EAST)': build_high_prb_cells_report(csv_folder, df=bh_4g),

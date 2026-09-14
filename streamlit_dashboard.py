@@ -34,18 +34,52 @@ from backend import smartcare_cem_processor as smartcare_cem
 from backend import complaint_analyzer
 from project_config import env_path_str
 
-# External FTPS-pulled reports (scripts/cell_info_report.py and the sibling
-# "PS Traffic per site" puller live outside this repo, in the sister
-# NOC Automation Suite project) - the dashboard only reads their finished
-# output files, same DATA_ROOT convention as every scraper in this project.
+# reports/cell_info_report.py (monthly FTPS cell inventory pull) and
+# reports/PS Traffic per site v3.py (per-site PS traffic puller), ported
+# in from the sibling NOC Automation Suite project (2026-09-14) - the
+# dashboard reads their finished output files, same DATA_ROOT convention
+# as every scraper in this project.
 CELL_INFO_OUTPUT_DIR = env_path_str(
     "CELL_INFO_OUTPUT_DIR",
     os.path.join(env_path_str("DATA_ROOT", r"C:\Users\user\Desktop\Libyana_Data"), "Output", "Cell_Info"),
 )
-PS_TRAFFIC_OUTPUT_DIR = env_path_str(
-    "PS_TRAFFIC_OUTPUT_DIR",
-    os.path.join(env_path_str("DATA_ROOT", r"C:\Users\user\Desktop\Libyana_Data"), "Output", "PS_Traffic_Output"),
-)
+
+
+def _load_ps_traffic_v3_module():
+    """PS Traffic per site v3.py's filename has spaces, so it can't be
+    `import`ed normally - load it by path instead, so its combine/summary
+    logic (combine_traffic_data, generate_summary_reports) can be reused
+    against a differently-sourced input without duplicating that logic."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "reports", "PS Traffic per site v3.py")
+    spec = importlib.util.spec_from_file_location("ps_traffic_per_site_v3", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ps_traffic_v3 = _load_ps_traffic_v3_module()
+PS_TRAFFIC_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "reports", "PS Traffic per site v3.py")
+
+
+def launch_ps_traffic_refresh():
+    """Runs reports/"PS Traffic per site v3.py" detached in the background,
+    same on-demand trigger as scheduler.py's own --ps-traffic-weekly (which
+    also runs it every Sunday) - see scheduler.py's _run_report_script for
+    why it's a subprocess rather than an in-process call, and why the child
+    needs PYTHONIOENCODING/PYTHONUTF8 forced (its emoji prints otherwise
+    crash under Windows' default cp1252 console codepage)."""
+    import subprocess
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    subprocess.Popen(
+        [sys.executable, PS_TRAFFIC_SCRIPT_PATH],
+        cwd=os.path.dirname(PS_TRAFFIC_SCRIPT_PATH),
+        env=child_env,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        start_new_session=True,
+    )
 
 st.set_page_config(page_title="Libyana Network Dashboard", page_icon="📊", layout="wide")
 
@@ -205,21 +239,72 @@ def cached_cell_info_report(month):
     return pd.read_excel(path), os.path.basename(path), raw_bytes
 
 
+# Column in each per-tech pipeline CSV that holds site-level PS/data traffic,
+# aligned to PS Traffic per site v3.py's own Date/Site_Name/Traffic_GB/
+# Technology shape so its combine_traffic_data()/generate_summary_reports()
+# can be reused unchanged. Traffic_4G.csv only carries downlink (no separate
+# uplink column in this pipeline's output), unlike the original script's raw
+# source which summed DL+UL - so this tab's 4G figures run slightly under
+# the FTPS-sourced tab's for the same reason.
+_PS_TRAFFIC_PIPELINE_COLUMNS = {
+    '2G': ('output/csv/Traffic_2G.csv', '2G PS Traffic (GB)'),
+    '3G': ('output/csv/Traffic_3G.csv', '3G PS Traffic (GB)'),
+    '4G': ('output/csv/Traffic_4G.csv', '4G DL Traffic (GB)'),
+}
+
+
 @st.cache_data(ttl=600)
-def cached_ps_traffic_report():
-    """The combined PS-traffic-per-site workbook (all sheets) from the sibling puller."""
-    candidates = sorted(
-        glob.glob(os.path.join(PS_TRAFFIC_OUTPUT_DIR, "Combined_Traffic_Report.xlsx"))
-        or glob.glob(os.path.join(PS_TRAFFIC_OUTPUT_DIR, "PS_Traffic_Combined_Report_*.xlsx")),
-        key=os.path.getmtime, reverse=True,
-    )
-    if not candidates:
-        return None, None, None
-    path = candidates[0]
-    sheets = pd.read_excel(path, sheet_name=None)
-    with open(path, 'rb') as f:
-        raw_bytes = f.read()
-    return sheets, os.path.basename(path), raw_bytes
+def cached_ps_traffic_from_pipeline():
+    """Same per-site PS traffic summaries PS Traffic per site v3.py builds,
+    but sourced from output/csv/Traffic_2G/3G/4G.csv - the same daily SFTP
+    pipeline that already feeds every other KPI in this dashboard - instead
+    of that script's own separate FTPS raw-data puller, whose source folder
+    (Input/FTP_RawData) stalled 2026-08-19. Returns None if the pipeline
+    CSVs aren't present."""
+    data_frames = {}
+    for tech, (path, col) in _PS_TRAFFIC_PIPELINE_COLUMNS.items():
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path, usecols=['Date', 'Site', col])
+        df = df.rename(columns={'Site': 'Site_Name', col: 'Traffic_GB'})
+        df['Technology'] = tech
+        data_frames[tech] = df[['Date', 'Site_Name', 'Traffic_GB', 'Technology']]
+
+    if not data_frames:
+        return None
+
+    combined_df = ps_traffic_v3.combine_traffic_data(data_frames)
+    if combined_df.empty:
+        return None
+    reports = ps_traffic_v3.generate_summary_reports(combined_df)
+
+    export_df = combined_df.copy()
+    export_df['Date'] = export_df['Date'].dt.strftime('%d-%m-%Y')
+    export_df = export_df.drop(columns=['Date_Formatted'])
+    sheets = {'All_Traffic_Data': export_df}
+    for sheet_name, df in reports.items():
+        if df.empty:
+            continue
+        df = df.copy()
+        if 'Date' in df.columns and 'Date_Formatted' in df.columns:
+            df['Date'] = df['Date_Formatted']
+            df = df.drop(columns=['Date_Formatted'])
+        sheets[sheet_name] = df
+    return sheets
+
+
+@st.cache_data(ttl=600)
+def cached_ps_traffic_from_pipeline_bytes():
+    import io
+    sheets = cached_ps_traffic_from_pipeline()
+    if not sheets:
+        return None
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+        autofit_excel_columns(writer)
+    return buf.getvalue()
 
 
 # Shorter TTL than the rest (600s) since the underlying live alarm feed
@@ -1728,8 +1813,9 @@ elif section == "📋 HQ Reports":
     ])
 
     with sec_tabs[0]:
-        st.caption("EAST branch only, built from output/csv/ history. Not included yet: "
-                   "Network Daily KPI's (a few columns still need source confirmation).")
+        st.caption("EAST branch only, built from output/csv/ history. North/South/Middle/West and "
+                   "nationwide \"Libyana\" totals aren't produced here - this pipeline only ever "
+                   "has FTP/OSS access to the East branch.")
 
         period_labels = {'Day': 'day', 'Week': 'week', 'Month': 'month', 'Quarter': 'quarter'}
         period_choice = st.radio(
@@ -1876,18 +1962,22 @@ elif section == "📋 HQ Reports":
 
     with sec_tabs[3]:
         st.caption(
-            "Daily PS (data) traffic per site across 2G/3G/4G, pulled and combined by the "
-            f"sibling \"PS Traffic per site\" puller. Read directly from {PS_TRAFFIC_OUTPUT_DIR}."
+            "Daily PS (data) traffic per site across 2G/3G/4G, in the same shape "
+            "PS Traffic per site v3.py produces (Date, Site, per-tech + Total GB, Region)."
         )
+        if st.button("🔄 Refresh PS Traffic now"):
+            launch_ps_traffic_refresh()
+            st.session_state['ps_traffic_refresh_started'] = True
+        if st.session_state.get('ps_traffic_refresh_started'):
+            st.info("Refresh started in the background — reload this tab in a few minutes.")
 
-        ps_sheets, ps_filename, ps_bytes = cached_ps_traffic_report()
+        ps_sheets = cached_ps_traffic_from_pipeline()
         if ps_sheets is None:
-            st.info(
-                "No combined PS Traffic report found yet. Run the sibling project's "
-                "\"PS Traffic per site v3.py\" puller to build it."
-            )
+            st.info("No PS traffic data available yet — output/csv/Traffic_2G/3G/4G.csv haven't been built.")
         else:
-            st.caption(f"Source file: {ps_filename}")
+            ps_bytes = cached_ps_traffic_from_pipeline_bytes()
+            date_col_config = {"Date": st.column_config.TextColumn("Date")}
+
             ps_sheet_tabs = st.tabs(list(ps_sheets.keys()))
             for ps_tab, (ps_sheet_name, ps_df) in zip(ps_sheet_tabs, ps_sheets.items()):
                 with ps_tab:
@@ -1901,13 +1991,21 @@ elif section == "📋 HQ Reports":
                         )
                     else:
                         shown = ps_df
-                    st.dataframe(shown, width='stretch', hide_index=True)
+                    # Date is already a plain "dd-mm-yyyy" string, but Streamlit's
+                    # dataframe widget auto-detects date-like text and re-renders
+                    # it per the browser's own locale (eg. "1/7/2026") unless
+                    # explicitly pinned to TextColumn - forcing our fixed format
+                    # to actually reach the screen unchanged.
+                    st.dataframe(
+                        shown, width='stretch', hide_index=True,
+                        column_config=date_col_config if 'Date' in shown.columns else None,
+                    )
                     st.caption(f"{len(shown)} row(s)")
 
             st.divider()
             st.download_button(
                 "⬇️ Download PS Traffic per site Report (.xlsx)", data=ps_bytes,
-                file_name=ps_filename,
+                file_name="PS_Traffic_per_site_pipeline.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 

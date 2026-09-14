@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 
 DASHBOARD_PORT = 8501
 DASHBOARD_BAT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_dashboard.bat")
+CELL_INFO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports", "cell_info_report.py")
+PS_TRAFFIC_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "reports", "PS Traffic per site v3.py"
+)
 
 
 class DailyScheduler:
@@ -479,6 +483,90 @@ class DailyScheduler:
             logger.error(traceback.format_exc())
             return False
 
+    # ------------------------------------------------------------------
+    # Cell Info (monthly) and PS Traffic per site (weekly) - both ported
+    # standalone scripts under reports/ (see reports/cell_info_report.py,
+    # reports/"PS Traffic per site v3.py"), each a top-level script rather
+    # than an importable function, so they're run as a subprocess instead
+    # of imported - importing PS Traffic per site v3.py in-process would
+    # also have its own parse_args() read *this* process's sys.argv and
+    # collide with scheduler.py's own CLI flags.
+    # ------------------------------------------------------------------
+
+    def _run_report_script(self, script_path, label):
+        """subprocess.run's text=True/encoding="utf-8" only govern how *this*
+        process decodes the child's output - the child still encodes its own
+        emoji-laden print()s using its own default console codepage (cp1252
+        on Windows) unless told otherwise, same UnicodeEncodeError class this
+        script's own stdout/stderr .reconfigure() calls above guard against.
+        PYTHONIOENCODING/PYTHONUTF8 force the child to use UTF-8 instead -
+        same fix scrapers/scraper_watchdog.py already applies to its own
+        subprocess launches."""
+        logger.info(f"   ▶️ Running {label} ({script_path})...")
+        child_env = os.environ.copy()
+        child_env["PYTHONUTF8"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        result = subprocess.run(
+            [sys.executable, script_path],
+            cwd=os.path.dirname(script_path),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=child_env,
+        )
+        for line in result.stdout.splitlines():
+            logger.info(f"   [{label}] {line}")
+        if result.returncode != 0:
+            for line in result.stderr.splitlines():
+                logger.error(f"   [{label}] {line}")
+            logger.error(f"   ❌ {label} exited with code {result.returncode}")
+            return False
+        return True
+
+    def run_cell_info_monthly_update(self):
+        """Entry point for the monthly (1st-of-month) scheduled task: pulls
+        this month's 2G/3G/4G cell inventory + EPT from the FTPS server on
+        port 21 (a separate account/protocol from the SFTP-22 creds used by
+        every other job here - see reports/cell_info_report.py) and rebuilds
+        the merged workbook the dashboard's Monthly Cell Info Report tab
+        reads."""
+        logger.info("=" * 70)
+        logger.info("📶 STARTING MONTHLY CELL INFO UPDATE")
+        logger.info("=" * 70)
+        start_time = time.time()
+        try:
+            self._ensure_dashboard_running()
+            ok = self._run_report_script(CELL_INFO_SCRIPT, "cell_info_report")
+            elapsed = time.time() - start_time
+            if ok:
+                logger.info(f"✅ MONTHLY CELL INFO UPDATE COMPLETED - {elapsed:.1f} seconds")
+            return ok
+        except Exception as e:
+            logger.error(f"❌ Monthly cell info update failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def run_ps_traffic_weekly_update(self):
+        """Entry point for the weekly (Sunday morning) scheduled task -
+        also callable on demand from the dashboard's "Refresh now" button
+        (see streamlit_dashboard.py). Runs reports/"PS Traffic per site
+        v3.py" against whatever's currently in PS_TRAFFIC_SOURCE_DIR."""
+        logger.info("=" * 70)
+        logger.info("📶 STARTING WEEKLY PS TRAFFIC PER SITE UPDATE")
+        logger.info("=" * 70)
+        start_time = time.time()
+        try:
+            self._ensure_dashboard_running()
+            ok = self._run_report_script(PS_TRAFFIC_SCRIPT, "PS Traffic per site v3")
+            elapsed = time.time() - start_time
+            if ok:
+                logger.info(f"✅ WEEKLY PS TRAFFIC UPDATE COMPLETED - {elapsed:.1f} seconds")
+            return ok
+        except Exception as e:
+            logger.error(f"❌ Weekly PS traffic update failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
 
 def main():
     parser = argparse.ArgumentParser(description='Libyana NPM Daily Scheduler')
@@ -488,6 +576,12 @@ def main():
                          help='Run only the ~6-hourly live cell KPI update, not the full daily pipeline')
     parser.add_argument('--interference-weekly', action='store_true',
                          help='Run only the weekly external-interference report update, not the full daily pipeline')
+    parser.add_argument('--cell-info-monthly', action='store_true',
+                         help='Run only the monthly Cell Info FTPS pull (reports/cell_info_report.py), '
+                              'not the full daily pipeline')
+    parser.add_argument('--ps-traffic-weekly', action='store_true',
+                         help='Run only the weekly PS Traffic per site report '
+                              '(reports/"PS Traffic per site v3.py"), not the full daily pipeline')
     args = parser.parse_args()
 
     scheduler = DailyScheduler()
@@ -498,6 +592,14 @@ def main():
 
     if args.interference_weekly:
         scheduler.run_interference_weekly_update()
+        return
+
+    if args.cell_info_monthly:
+        scheduler.run_cell_info_monthly_update()
+        return
+
+    if args.ps_traffic_weekly:
+        scheduler.run_ps_traffic_weekly_update()
         return
 
     if args.date:
