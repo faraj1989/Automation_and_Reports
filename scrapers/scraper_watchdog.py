@@ -39,12 +39,24 @@ CHECK_INTERVAL_SECONDS = 60
 # skip - must match the PASSWORD each scraper reads (see each script's
 # `PASSWORD = env_str("..._PASSWORD")` line).
 CONTINUOUS_SCRIPTS = [
-    {"name": "MAE Scraper", "file": "scrapers/mae_scraper.py", "password_env": "MAE_PASSWORD"},
-    {"name": "MAE Historical Alarms Scraper", "file": "scrapers/mae_historical_alarms_scraper.py", "password_env": "MAE_PASSWORD"},
-    {"name": "NetEco All Alarms Scraper", "file": "scrapers/neteco_all_alarms_scraper_launcher.py", "password_env": "NETECO_PASSWORD"},
-    {"name": "NetEco Historical Alarms Scraper", "file": "scrapers/neteco_historical_alarms_scraper.py", "password_env": "NETECO_PASSWORD"},
-    {"name": "NCE Active Alarms Scraper", "file": "scrapers/nce_active_alarms_scraper.py", "password_env": "NCE_PASSWORD"},
-    {"name": "NCE Historical Alarms Scraper", "file": "scrapers/nce_historical_alarms_scraper.py", "password_env": "NCE_PASSWORD"},
+    # Combined 2026-09-14 (see chat that day): mae_scraper.py +
+    # mae_historical_alarms_scraper.py merged into one Chrome process
+    # (two tabs, one login session) to cut memory - validated live over 7+
+    # clean cycles plus a forced Chrome-crash recovery test before being
+    # adopted here. If NCE/NetEco get the same treatment later, replace
+    # their two entries below the same way.
+    {"name": "MAE Combined Scraper", "file": "scrapers/mae_combined_scraper.py", "password_env": "MAE_PASSWORD"},
+    # Combined 2026-09-14: nce_active_alarms_scraper.py + nce_historical_
+    # alarms_scraper.py merged the same way - validated live over 3+ clean
+    # cycles (worked on the first attempt, no bugs to fix, since the two
+    # fixes MAE's pilot needed were built in from the start).
+    {"name": "NCE Combined Scraper", "file": "scrapers/nce_combined_scraper.py", "password_env": "NCE_PASSWORD"},
+    # Combined 2026-09-14/15: "neteco_continuous all alrams.py" (Current) +
+    # neteco_historical_alarms_scraper.py merged the same way - the most
+    # structurally different of the three (ID-based export flow, not
+    # text-based), validated live over 3+ clean cycles, worked on the
+    # first attempt.
+    {"name": "NetEco Combined Scraper", "file": "scrapers/neteco_combined_scraper.py", "password_env": "NETECO_PASSWORD"},
 ]
 
 

@@ -193,6 +193,10 @@ def create_driver():
     chrome_options.add_argument("--allow-legacy-insecure-renegotiation")
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--renderer-process-limit=1")
+    chrome_options.add_argument("--js-flags=--max-old-space-size=384")
 
     chrome_options.add_experimental_option(
         "prefs",
