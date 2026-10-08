@@ -15,6 +15,13 @@ import paramiko
 
 logger = logging.getLogger(__name__)
 
+# Only these reports (by base name, timestamp stripped) get their older
+# copies deleted from the SFTP server. Every other report's history is
+# left on the server untouched.
+REMOTE_CLEANUP_BASE_NAMES = {
+    'all last hours all cells level_last week',
+}
+
 
 class SFTPDownloader:
     """Handles SFTP connection, download and file organisation with duplicate prevention."""
@@ -263,9 +270,14 @@ class SFTPDownloader:
         """
         Delete older remote zip files sharing `base_name`, keeping only
         `keep_filename` (the one just downloaded and processed locally).
+        Only applies to reports listed in REMOTE_CLEANUP_BASE_NAMES - any
+        other report is never deleted from the server.
         Best-effort: a failed remote delete is logged and skipped rather
         than raised, so it can't take down the rest of the run.
         """
+        if base_name not in REMOTE_CLEANUP_BASE_NAMES:
+            return
+
         try:
             remote_files = self.sftp.listdir()
         except Exception as e:
@@ -407,8 +419,8 @@ class SFTPDownloader:
                 # ============================================================
                 # STEP 9: Now that the new file is safely downloaded and
                 # unzipped, delete older remote versions of this same report
-                # to keep FTP storage flat (rolling-window reports otherwise
-                # accumulate one new zip per fetch forever).
+                # - only for reports in REMOTE_CLEANUP_BASE_NAMES; all other
+                # reports keep their full history on the server.
                 # ============================================================
                 self.cleanup_old_remote_duplicates(base_name, fname)
 

@@ -40,6 +40,7 @@ import logging
 import re
 import zipfile
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -259,6 +260,21 @@ _HISTORICAL_COLUMNS = ["Source", "Site", "Name", "Occurred On", "Cleared On", "S
 
 
 def _parse_historical_export(export_path: Path, source: str) -> pd.DataFrame:
+    """Cached front for _parse_historical_export_uncached - keyed on the
+    file's mtime too, so a re-written export is re-parsed. The all-days
+    range view (build_daily_noc_alarm_range) asks for the same handful of
+    rolling-window exports once per day it covers; without this each of
+    them was re-parsed dozens of times. Returns a fresh copy each call."""
+    path = Path(export_path)
+    return _parse_historical_export_cached(str(path), path.stat().st_mtime).assign(Source=source)
+
+
+@lru_cache(maxsize=96)
+def _parse_historical_export_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    return _parse_historical_export_uncached(Path(path_str), "")
+
+
+def _parse_historical_export_uncached(export_path: Path, source: str) -> pd.DataFrame:
     """Normalize one MAE/NetEco/NCE Historical Alarms export (.csv or .zip
     of parts) into a common schema. The header isn't at a fixed row (a
     preamble of title/save-time/username precedes it, and an embedded
@@ -309,23 +325,30 @@ def _parse_historical_export(export_path: Path, source: str) -> pd.DataFrame:
     return df
 
 
-def _find_best_historical_export(base_dir: str, glob_pattern: str, target_date: str) -> Optional[Path]:
-    """The rolling-window historical exports mean the MOST RECENT export
-    that still covers target_date has the most complete Cleared-On picture
-    for that day's alarms (an alarm from target_date that only cleared the
-    next day needs an export taken after it cleared to show that). Search
-    target_date's own dated folder and every later one up to today, and
-    return the single most-recently-modified matching file found - or None
-    if the raw export has already aged out of the retention window."""
+def _find_best_historical_export(base_dir: str, glob_pattern: str, target_date: str):
+    """(export path, covers_full_day) for target_date, or (None, False) if
+    no export from target_date's folder onward exists.
+
+    Each historical export is a rolling window, not full history - checked
+    2026-10-08: MAE ~7 days back, NetEco/NCE ~3 days. The newest export
+    has the most complete Cleared-On picture, but for an older target_date
+    its window can start partway through that day (today's 09:19 MAE
+    export started at 10-01 09:20), silently dropping that day's morning
+    outages. So: walk dated folders newest-first, and take the latest
+    export of the first folder whose window (earliest Occurred On) reaches
+    back to target_date's midnight. If none does (the day falls in a
+    scraping gap), fall back to whichever export reaches back furthest,
+    flagged as partial."""
     base_path = Path(base_dir)
     if not base_path.exists():
-        return None
+        return None, False
     try:
         target = datetime.strptime(target_date, "%Y-%m-%d").date()
     except ValueError:
-        return None
+        return None, False
+    day_start = pd.Timestamp(target)
 
-    candidates = []
+    folders = []
     for entry in base_path.iterdir():
         if not entry.is_dir() or len(entry.name) != 10:
             continue
@@ -334,10 +357,78 @@ def _find_best_historical_export(base_dir: str, glob_pattern: str, target_date: 
         except ValueError:
             continue
         if folder_date >= target:
-            candidates.extend(entry.glob(glob_pattern))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+            folders.append((folder_date, entry))
+
+    best_partial, best_partial_start = None, None
+    for _, folder in sorted(folders, reverse=True):
+        files = list(folder.glob(glob_pattern))
+        if not files:
+            continue
+        latest = max(files, key=lambda p: p.stat().st_mtime)
+        parsed = _parse_historical_export(latest, "")
+        window_start = parsed['Occurred On'].min() if not parsed.empty else pd.NaT
+        if pd.isna(window_start):
+            continue
+        if window_start <= day_start:
+            return latest, True
+        if best_partial_start is None or window_start < best_partial_start:
+            best_partial, best_partial_start = latest, window_start
+    return best_partial, False
+
+
+# Current-alarm export per historical source - see _merge_still_active.
+_CURRENT_EXPORT_FOR_SOURCE = {
+    'MAE': (CURRENT_ALARMS_DIR, MAE_CURRENT_GLOB),
+    'NetEco': (CURRENT_ALARMS_DIR, NETECO_CURRENT_GLOB),
+    'NCE': (NCE_CURRENT_ALARMS_DIR, NCE_CURRENT_GLOB),
+}
+
+
+_ALARM_EVENT_KEY = ['Site', 'Name', 'Occurred On']
+
+
+def _dedupe_alarm_events(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per alarm event (site/name/occurred time) across several
+    overlapping exports, keeping a row that has a Cleared On over one that
+    doesn't - distinct events at the same site (several outages in one
+    day) all survive, since their Occurred On differs."""
+    if df.empty:
+        return df
+    has_clear = df['Cleared On'].notna()
+    return (df.assign(_has_clear=has_clear).sort_values('_has_clear', ascending=False)
+            .drop_duplicates(subset=_ALARM_EVENT_KEY).drop(columns='_has_clear')
+            .reset_index(drop=True))
+
+
+def _merge_still_active(historical: pd.DataFrame, source: str):
+    """(merged frame, live snapshot time or None).
+
+    Historical exports only list CLEARED alarms (verified 2026-10-08:
+    every NE Is Disconnected row in them has a Cleared On), so a site that
+    went down on a given day and is still down now was missing from that
+    day's report entirely - e.g. AJDB009/SLOG008/BGZ197 on 2026-10-07.
+    Append the source's latest current-alarm export (Cleared On left
+    empty = not cleared), dropping any alarm the historical export already
+    has as cleared (same site/name/occurred time - it cleared after the
+    live snapshot was taken). Those rows carry 'Live Snapshot' (the
+    export's mtime) so _event_status can tell "still active per a fresh
+    snapshot" from "was active in a stale one" - the latter is Unknown,
+    not proof the site is still down."""
+    base_dir, pattern = _CURRENT_EXPORT_FOR_SOURCE[source]
+    current_path = _find_latest_export(base_dir, pattern)
+    historical = historical.assign(**{'Live Snapshot': pd.NaT})
+    if current_path is None:
+        return historical, None
+    snapshot_time = pd.Timestamp(datetime.fromtimestamp(current_path.stat().st_mtime))
+    current = _parse_historical_export(current_path, source)
+    if current.empty:
+        return historical, snapshot_time
+    current = current.assign(**{'Cleared On': pd.NaT, 'Live Snapshot': snapshot_time})
+    if not historical.empty:
+        seen = pd.MultiIndex.from_frame(historical[_ALARM_EVENT_KEY])
+        current = current[~pd.MultiIndex.from_frame(current[_ALARM_EVENT_KEY]).isin(seen)]
+        return pd.concat([historical, current], ignore_index=True), snapshot_time
+    return current, snapshot_time
 
 
 def _day_overlap_hours(df: pd.DataFrame, target_date: str) -> pd.DataFrame:
@@ -381,16 +472,26 @@ def load_historical_alarms_for_date(target_date: str) -> Dict:
     }
     result = {}
     for source, (base_dir, pattern) in sources.items():
-        export_path = _find_best_historical_export(base_dir, pattern, target_date)
+        export_path, covers_full_day = _find_best_historical_export(base_dir, pattern, target_date)
         if export_path is None:
-            result[source] = {'available': False, 'alarms': pd.DataFrame()}
+            result[source] = {'available': False, 'alarms': pd.DataFrame(), 'covers_full_day': False}
             continue
         raw = _parse_historical_export(export_path, source)
+        # The full-day export can be days older than the newest one (it's
+        # picked for reaching back to midnight), so an event from that day
+        # which cleared after it was taken would look still-open there -
+        # layer the newest export on top for the freshest Cleared On.
+        newest_path = _find_latest_export(base_dir, pattern)
+        if newest_path is not None and newest_path != export_path:
+            raw = pd.concat([raw, _parse_historical_export(newest_path, source)], ignore_index=True)
+        raw, snapshot_time = _merge_still_active(_dedupe_alarm_events(raw), source)
         result[source] = {
             'available': True,
             'alarms': _day_overlap_hours(raw, target_date),
             'export_file': export_path.name,
             'export_time': datetime.fromtimestamp(export_path.stat().st_mtime),
+            'covers_full_day': covers_full_day,
+            'live_snapshot_time': snapshot_time,
         }
     return result
 
@@ -524,9 +625,82 @@ _RICH_ALARM_TABLE_COLUMNS = [
     'Power Reason (NOC)', 'Mains Failure Time', 'Transmission Reason (NOC)', 'NCE Last Occurred',
 ]
 
+# Extra per-site columns the historical (day) view adds after Last Occurred
+# - see _build_rich_alarm_table.
+_DAY_STATUS_COLUMNS = ['Cleared On', 'Status', 'Outage Class', 'Outage Events']
+
+# An outage event lasting at least this long (occurred -> cleared, or ->
+# now if still open) is classed "Long-Term Outage" rather than "Normal".
+# Judgment call, not from any upstream config: a week is past any
+# ordinary power/TX restoration cycle (the longest normal events seen
+# 2026-09/10 were ~4 days, e.g. AJDB007), while the sites that motivated
+# this (ECV001 since 2026-05, BYDA001 since 2026-03, BGZ162/UECV001 since
+# late 2025) are months in - they look decommissioned or parked, and at
+# 24h/day each they otherwise add ~96 hours to every day's Total Downtime.
+LONG_TERM_OUTAGE_DAYS = 7
+
+STATUS_CLEARED = "Cleared"
+STATUS_NOT_CLEARED = "Not Cleared"
+STATUS_UNKNOWN = "Unknown"
+CLASS_NORMAL = "Normal"
+CLASS_LONG_TERM = "Long-Term Outage"
+
+
+def _fmt_ts(ts) -> str:
+    return ts.strftime('%Y-%m-%d %H:%M:%S') if pd.notna(ts) else "-"
+
+
+def _event_status(cleared_on, live_snapshot, now: pd.Timestamp) -> str:
+    """Cleared when the event has its own Cleared On. Otherwise it only
+    came from a live current-alarm snapshot (_merge_still_active): Not
+    Cleared if that snapshot is fresh (LIVE_STALE_MINUTES), Unknown if
+    it's old - a stale snapshot showing the alarm is not proof the site is
+    still down now."""
+    if pd.notna(cleared_on):
+        return STATUS_CLEARED
+    if pd.notna(live_snapshot) and (now - live_snapshot) <= pd.Timedelta(minutes=LIVE_STALE_MINUTES):
+        return STATUS_NOT_CLEARED
+    return STATUS_UNKNOWN
+
+
+def _build_outage_events(down: pd.DataFrame, now: pd.Timestamp) -> pd.DataFrame:
+    """Every NE Is Disconnected event in down (already day-clipped by
+    _day_overlap_hours), one row each - a site with three separate outages
+    that day keeps all three here, while the per-site table rolls them up."""
+    cols = ['Site Name', 'MO Name', 'Occurred On', 'Cleared On', 'Status', 'Outage Class',
+            'Hours This Day', 'Event Duration (Hours)']
+    if down.empty:
+        return pd.DataFrame(columns=cols)
+    live_snap = down['Live Snapshot'] if 'Live Snapshot' in down.columns else pd.Series(pd.NaT, index=down.index)
+    end = down['Cleared On'].fillna(now)
+    duration_h = ((end - down['Occurred On']).dt.total_seconds() / 3600.0).clip(lower=0)
+    events = pd.DataFrame({
+        'Site Name': down['Site Code'],
+        'MO Name': down['Site'].fillna(down['Site Code']),
+        'Occurred On': down['Occurred On'],
+        'Cleared On': down['Cleared On'],
+        'Status': [_event_status(c, s, now) for c, s in zip(down['Cleared On'], live_snap)],
+        'Outage Class': (duration_h >= LONG_TERM_OUTAGE_DAYS * 24).map({True: CLASS_LONG_TERM, False: CLASS_NORMAL}),
+        'Hours This Day': down['Overlap Hours'].round(2) if 'Overlap Hours' in down.columns else 0.0,
+        'Event Duration (Hours)': duration_h.round(2),
+    })
+    return events.sort_values(['Site Name', 'Occurred On']).reset_index(drop=True)[cols]
+
+
+def _site_status(statuses: pd.Series) -> str:
+    """Site-level rollup of its events' statuses: any still-open event
+    makes the site Not Cleared; failing that, any unverifiable one makes it
+    Unknown; only all-cleared is Cleared."""
+    values = set(statuses)
+    if STATUS_NOT_CLEARED in values:
+        return STATUS_NOT_CLEARED
+    if STATUS_UNKNOWN in values:
+        return STATUS_UNKNOWN
+    return STATUS_CLEARED
+
 
 def _build_rich_alarm_table(mae: pd.DataFrame, neteco: pd.DataFrame, nce: pd.DataFrame,
-                             hours_mode: str = 'day') -> pd.DataFrame:
+                             hours_mode: str = 'day', events: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Per-disconnected-site table matching the original sibling suite's
     Live_NOC_Report.xlsx column layout (Site Name/MO Name/Alarm Name/Last
     Occurred/Power Reason (NOC)/Mains Failure Time/Transmission Reason
@@ -537,17 +711,31 @@ def _build_rich_alarm_table(mae: pd.DataFrame, neteco: pd.DataFrame, nce: pd.Dat
     schema). hours_mode='day' sums each site's already-day-clipped
     'Overlap Hours' (for one historical calendar day); hours_mode='live'
     instead reports elapsed time since the alarm's own Last Occurred, since
-    a live snapshot has no day-clipped Overlap Hours column at all."""
+    a live snapshot has no day-clipped Overlap Hours column at all.
+
+    hours_mode='day' also adds _DAY_STATUS_COLUMNS, rolled up from events
+    (_build_outage_events): Status via _site_status, Cleared On = latest
+    clear time when Cleared, Outage Class = Long-Term if any of the site's
+    events is, and how many events the site had that day. The live view
+    adds only Outage Class - every row there is uncleared by definition."""
+    columns = list(_RICH_ALARM_TABLE_COLUMNS)
+    if hours_mode == 'day':
+        columns[columns.index('Last Occurred') + 1:1] = _DAY_STATUS_COLUMNS
+    else:
+        columns.insert(columns.index('Last Occurred') + 1, 'Outage Class')
     if mae.empty or 'Name' not in mae.columns:
-        return pd.DataFrame(columns=_RICH_ALARM_TABLE_COLUMNS)
+        return pd.DataFrame(columns=columns)
 
     down = mae[mae['Name'] == SITE_DOWN_ALARM_NAME].dropna(subset=['Site Code'])
     if down.empty:
-        return pd.DataFrame(columns=_RICH_ALARM_TABLE_COLUMNS)
+        return pd.DataFrame(columns=columns)
 
     hours_by_site = None
     if hours_mode == 'day' and 'Overlap Hours' in down.columns:
         hours_by_site = down.groupby('Site Code')['Overlap Hours'].sum()
+    events_by_site = None
+    if hours_mode == 'day' and events is not None and not events.empty:
+        events_by_site = {site: grp for site, grp in events.groupby('Site Name')}
 
     if 'Occurred On' in down.columns:
         down = down.sort_values('Occurred On', ascending=False).drop_duplicates(subset=['Site Code'])
@@ -570,7 +758,7 @@ def _build_rich_alarm_table(mae: pd.DataFrame, neteco: pd.DataFrame, nce: pd.Dat
             down_hours = 0.0
         power_reason, mains_time = _power_reason_and_time(neteco, site)
         trans_reason, nce_time = _transmission_reason_and_time(nce, site, ancestor_map)
-        rows.append({
+        row = {
             'Site Name': site,
             'MO Name': r.get('Site') or site,
             'Alarm Name': r['Name'],
@@ -580,22 +768,76 @@ def _build_rich_alarm_table(mae: pd.DataFrame, neteco: pd.DataFrame, nce: pd.Dat
             'Mains Failure Time': mains_time,
             'Transmission Reason (NOC)': trans_reason,
             'NCE Last Occurred': nce_time,
-        })
-    return pd.DataFrame(rows, columns=_RICH_ALARM_TABLE_COLUMNS).sort_values(
+        }
+        if hours_mode == 'day' and events_by_site is not None:
+            site_events = events_by_site.get(site)
+            status = _site_status(site_events['Status'])
+            row['Status'] = status
+            row['Cleared On'] = _fmt_ts(site_events['Cleared On'].max()) if status == STATUS_CLEARED else "-"
+            row['Outage Class'] = (CLASS_LONG_TERM if (site_events['Outage Class'] == CLASS_LONG_TERM).any()
+                                   else CLASS_NORMAL)
+            row['Outage Events'] = len(site_events)
+        elif hours_mode != 'day':
+            row['Outage Class'] = (CLASS_LONG_TERM if down_hours >= LONG_TERM_OUTAGE_DAYS * 24
+                                   else CLASS_NORMAL)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns).sort_values(
         'Last Occurred', ascending=False).reset_index(drop=True)
 
 
-def _alarm_table_metrics(table: pd.DataFrame) -> dict:
-    """The 3 headline counts from the original Live_NOC_Report.xlsx metric
-    tiles, derived from the rich alarm table itself so they can never drift
-    out of sync with what the table actually shows."""
-    if table.empty:
-        return {'ne_disconnected': 0, 'mains_failure': 0, 'nce_transmission': 0}
+def noc_alarm_kpis(sites: pd.DataFrame, exclude_long_term: bool = False) -> dict:
+    """The Daily NOC Alarm Analysis headline tiles, derived from the
+    per-site table itself so they can never drift out of sync with what
+    the table shows. Counts are distinct sites - identical to row counts
+    for one day, and "sites affected at least once" over a multi-day
+    stack. exclude_long_term drops Long-Term Outage sites first (they stay
+    in the table/exports; this is only for operational KPIs)."""
+    keys = ('ne_disconnected', 'total_down_hours', 'mains_failure', 'nce_transmission',
+            'cleared', 'not_cleared', 'unknown', 'long_term')
+    if sites is None or sites.empty:
+        return dict.fromkeys(keys, 0)
+    long_term_mask = (sites['Outage Class'] == CLASS_LONG_TERM) if 'Outage Class' in sites.columns \
+        else pd.Series(False, index=sites.index)
+    long_term = int(sites.loc[long_term_mask, 'Site Name'].nunique())
+    if exclude_long_term:
+        sites = sites[~long_term_mask]
+
+    def distinct(mask):
+        return int(sites.loc[mask, 'Site Name'].nunique())
+
+    status = sites['Status'] if 'Status' in sites.columns else pd.Series("", index=sites.index)
     return {
-        'ne_disconnected': len(table),
-        'mains_failure': int((table['Mains Failure Time'] != '-').sum()),
-        'nce_transmission': int((table['Transmission Reason (NOC)'] != '-').sum()),
+        'ne_disconnected': int(sites['Site Name'].nunique()),
+        'total_down_hours': float(sites['Down Hours'].sum()),
+        'mains_failure': distinct(sites['Mains Failure Time'] != '-'),
+        'nce_transmission': distinct(sites['Transmission Reason (NOC)'] != '-'),
+        'cleared': distinct(status == STATUS_CLEARED),
+        'not_cleared': distinct(status == STATUS_NOT_CLEARED),
+        'unknown': distinct(status == STATUS_UNKNOWN),
+        'long_term': long_term,
     }
+
+
+def _alarm_table_metrics(table: pd.DataFrame) -> dict:
+    """Live view's 3 tiles - kept as its own name since the live section
+    only ever showed these three."""
+    k = noc_alarm_kpis(table)
+    return {key: k[key] for key in ('ne_disconnected', 'mains_failure', 'nce_transmission')}
+
+
+def _data_quality_row(target_date: str, by_source: Dict) -> dict:
+    """One Data Quality row for target_date: overall coverage plus each
+    source's export file/time and whether it spans the whole day."""
+    partial = [src for src, info in by_source.items()
+               if not (info['available'] and info.get('covers_full_day'))]
+    row = {'Date': target_date, 'Data Coverage': f"Partial: {', '.join(partial)}" if partial else "Full"}
+    for src, info in by_source.items():
+        row[f'{src} Export'] = info.get('export_file') or "missing"
+        row[f'{src} Export Time'] = _fmt_ts(pd.Timestamp(info['export_time'])) if info.get('export_time') else "-"
+        row[f'{src} Full Day'] = "Yes" if info['available'] and info.get('covers_full_day') else "No"
+    snap = by_source['MAE'].get('live_snapshot_time')
+    row['Live Snapshot (MAE)'] = _fmt_ts(snap) if snap is not None else "missing"
+    return row
 
 
 def build_daily_noc_alarm_report(target_date: str) -> Dict:
@@ -606,16 +848,18 @@ def build_daily_noc_alarm_report(target_date: str) -> Dict:
     Mirrors the sibling suite's own current-alarm triage logic
     (enhanced_noc_analysis.build_triage's per-site evidence-joining) but
     computed from raw historical exports for one specific calendar day
-    instead of "right now."""
+    instead of "right now." 'outage_events' keeps every individual
+    NE Is Disconnected event behind the per-site rows."""
     by_source = load_historical_alarms_for_date(target_date)
     mae, neteco, nce = by_source['MAE']['alarms'], by_source['NetEco']['alarms'], by_source['NCE']['alarms']
 
-    down_summary = _build_rich_alarm_table(mae, neteco, nce, hours_mode='day')
-    sites_down = len(down_summary)
-    total_down_hours = float(down_summary['Down Hours'].sum()) if not down_summary.empty else 0.0
-    if not down_summary.empty:
-        down_summary.insert(0, 'Date', target_date)
-    metrics = _alarm_table_metrics(down_summary)
+    down = mae[mae['Name'] == SITE_DOWN_ALARM_NAME].dropna(subset=['Site Code']) \
+        if not mae.empty and 'Name' in mae.columns else pd.DataFrame()
+    events = _build_outage_events(down, pd.Timestamp.now())
+    down_summary = _build_rich_alarm_table(mae, neteco, nce, hours_mode='day', events=events)
+    down_summary.insert(0, 'Date', target_date)
+    events.insert(0, 'Date', target_date)
+    metrics = noc_alarm_kpis(down_summary)
 
     neteco_display = neteco.rename(columns={'Site Code': 'Site Canonical'}) if not neteco.empty else neteco
     nce_display = nce.rename(columns={'Site Code': 'Site Canonical'}) if not nce.empty else nce
@@ -624,15 +868,189 @@ def build_daily_noc_alarm_report(target_date: str) -> Dict:
         'date': target_date,
         'metrics': metrics,
         'available': any(info['available'] for info in by_source.values()),
-        'sites_down': sites_down,
-        'total_down_hours': total_down_hours,
+        'sites_down': metrics['ne_disconnected'],
+        'total_down_hours': metrics['total_down_hours'],
         'down_sites_summary': down_summary,
+        'outage_events': events,
         'neteco_alarms': neteco_display,
         'nce_alarms': nce_display,
+        'data_quality': _data_quality_row(target_date, by_source),
         'sources': {src: {'available': info['available'], 'export_file': info.get('export_file'),
-                           'export_time': info.get('export_time')}
+                           'export_time': info.get('export_time'),
+                           'covers_full_day': info.get('covers_full_day', False)}
                     for src, info in by_source.items()},
     }
+
+
+def available_daily_noc_alarm_dates() -> List[str]:
+    """Every calendar day from the earliest alarm the oldest surviving MAE
+    historical export reaches back to, through today - the range the
+    dashboard's date picker allows. Based on file content, not folder
+    names: retention purges old exports but leaves their dated folders
+    behind empty (2026-08-25..09-15 as of 2026-10-08). Days in a scraping
+    gap stay in the range; they just come back flagged Partial."""
+    base_path = Path(MAE_HISTORICAL_DIR)
+    if not base_path.exists():
+        return []
+    for folder in sorted(p for p in base_path.iterdir() if p.is_dir()):
+        files = list(folder.glob(MAE_HISTORICAL_GLOB))
+        if not files:
+            continue
+        parsed = _parse_historical_export(max(files, key=lambda p: p.stat().st_mtime), 'MAE')
+        if parsed.empty or parsed['Occurred On'].isna().all():
+            continue
+        oldest = parsed['Occurred On'].min().date()
+        today = datetime.now().date()
+        return [(oldest + timedelta(days=i)).isoformat() for i in range((today - oldest).days + 1)]
+    return []
+
+
+def build_daily_noc_alarm_range(start_date: str, end_date: str) -> Dict:
+    """build_daily_noc_alarm_report for every day start_date..end_date
+    (inclusive), stacked: 'sites' (per-site rows, Date column first),
+    'events' (every outage event), 'data_quality' (one row per day - also
+    the list of days the range covers, so a day with zero outages still
+    gets a summary row). Days with no MAE export at all are skipped."""
+    site_frames, event_frames, dq_rows = [], [], []
+    for day in pd.date_range(start_date, end_date, freq='D').strftime('%Y-%m-%d'):
+        report = build_daily_noc_alarm_report(day)
+        if not report['sources']['MAE']['available']:
+            continue
+        dq_rows.append(report['data_quality'])
+        if not report['down_sites_summary'].empty:
+            site_frames.append(report['down_sites_summary'])
+        if not report['outage_events'].empty:
+            event_frames.append(report['outage_events'])
+    return {
+        'sites': pd.concat(site_frames, ignore_index=True) if site_frames else pd.DataFrame(),
+        'events': pd.concat(event_frames, ignore_index=True) if event_frames else pd.DataFrame(),
+        'data_quality': pd.DataFrame(dq_rows),
+    }
+
+
+def summarize_noc_alarm_days(sites: pd.DataFrame, data_quality: pd.DataFrame,
+                             exclude_long_term: bool = False) -> pd.DataFrame:
+    """One row per day in data_quality: noc_alarm_kpis over that day's
+    rows of sites (already filtered by the caller, if it filters), plus the
+    day's Data Coverage. Newest day first."""
+    rows = []
+    for _, dq in data_quality.iterrows():
+        day_sites = sites[sites['Date'] == dq['Date']] if not sites.empty else sites
+        k = noc_alarm_kpis(day_sites, exclude_long_term=exclude_long_term)
+        rows.append({
+            'Date': dq['Date'],
+            'Count of NE Is Disconnected': k['ne_disconnected'],
+            'Total Downtime (Hours)': round(k['total_down_hours'], 2),
+            'Count of Mains Failure': k['mains_failure'],
+            'Count of NCE Transmission Alarm Sites': k['nce_transmission'],
+            'Cleared': k['cleared'],
+            'Not Cleared': k['not_cleared'],
+            'Unknown': k['unknown'],
+            'Long-Term Outage Sites': k['long_term'],
+            'Data Coverage': dq['Data Coverage'],
+        })
+    summary = pd.DataFrame(rows)
+    return summary.sort_values('Date', ascending=False).reset_index(drop=True) if not summary.empty else summary
+
+
+# Power Reason filter choices -> substring each matches in 'Power Reason (NOC)'.
+POWER_REASON_FILTERS = {
+    'Mains Failure': 'Mains Failure', 'BLVD': 'BLVD', 'LLVD': 'LLVD',
+    'No Power Alarm': 'No Power Alarm',
+}
+TRANSMISSION_FILTERS = ('Own NCE alarm', 'Via upstream hub', 'No NCE alarm')
+
+
+def apply_noc_alarm_filters(sites: pd.DataFrame, data_quality: pd.DataFrame, site_codes=None,
+                            statuses=None, outage_classes=None, power_reasons=None,
+                            transmission=None, min_hours=None, max_hours=None,
+                            coverage=None) -> pd.DataFrame:
+    """Filter the per-site table. Each argument left None/empty means "no
+    filter on that field"; multi-value ones OR within a field and AND
+    across fields. site_codes match as case-insensitive substrings
+    (so "BGZ" catches every Benghazi site). coverage is a subset of
+    {'Full', 'Partial'}, matched against each row's day in data_quality."""
+    if sites.empty:
+        return sites
+    mask = pd.Series(True, index=sites.index)
+    if site_codes:
+        pattern = '|'.join(re.escape(c.strip()) for c in site_codes if c.strip())
+        if pattern:
+            mask &= sites['Site Name'].astype(str).str.contains(pattern, case=False, na=False)
+    if statuses:
+        mask &= sites['Status'].isin(statuses)
+    if outage_classes:
+        mask &= sites['Outage Class'].isin(outage_classes)
+    if power_reasons:
+        reason = sites['Power Reason (NOC)'].astype(str)
+        mask &= pd.concat([reason.str.contains(POWER_REASON_FILTERS[p], regex=False)
+                           for p in power_reasons], axis=1).any(axis=1)
+    if transmission:
+        trans = sites['Transmission Reason (NOC)'].astype(str)
+        kinds = pd.Series('Own NCE alarm', index=sites.index)
+        kinds[trans.str.startswith('(via hub')] = 'Via upstream hub'
+        kinds[trans == '-'] = 'No NCE alarm'
+        mask &= kinds.isin(transmission)
+    if min_hours is not None:
+        mask &= sites['Down Hours'] >= min_hours
+    if max_hours is not None:
+        mask &= sites['Down Hours'] <= max_hours
+    if coverage and not data_quality.empty:
+        day_cov = data_quality.set_index('Date')['Data Coverage'].map(
+            lambda c: 'Full' if c == 'Full' else 'Partial')
+        mask &= sites['Date'].map(day_cov).isin(coverage)
+    return sites[mask].reset_index(drop=True)
+
+
+def active_outages(sites: pd.DataFrame) -> pd.DataFrame:
+    """Sites whose most recent day in sites is still Not Cleared/Unknown -
+    one row per site (its latest day), longest-down first."""
+    if sites.empty:
+        return sites
+    latest = sites.sort_values('Date').drop_duplicates(subset=['Site Name'], keep='last')
+    active = latest[latest['Status'].isin([STATUS_NOT_CLEARED, STATUS_UNKNOWN])]
+    return active.sort_values('Last Occurred').reset_index(drop=True)
+
+
+_STATUS_FILLS = {STATUS_CLEARED: 'C6EFCE', STATUS_NOT_CLEARED: 'FFC7CE', STATUS_UNKNOWN: 'FFEB9C',
+                 CLASS_LONG_TERM: 'D9D2E9'}
+
+
+def build_noc_alarm_workbook(sheets: List, info: List) -> bytes:
+    """Formatted .xlsx for the Daily NOC Alarm Analysis export: an Info
+    sheet (info = [(field, value), ...] - report scope and active filters),
+    then one sheet per (name, DataFrame) in sheets, each with a styled
+    frozen header, autofilter, auto-sized columns, and Status/Outage Class
+    cells colour-coded the same way as the dashboard."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    import io
+
+    header_fill = PatternFill('solid', fgColor='1F4E78')
+    header_font = Font(bold=True, color='FFFFFF')
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        pd.DataFrame(info, columns=['Field', 'Value']).to_excel(writer, sheet_name='Info', index=False)
+        for name, df in sheets:
+            out = df if df is not None and not df.empty else pd.DataFrame([{'Note': 'No rows for this selection'}])
+            out.to_excel(writer, sheet_name=name[:31], index=False)
+        for ws in writer.book.worksheets:
+            for cell in ws[1]:
+                cell.fill, cell.font = header_fill, header_font
+                cell.alignment = Alignment(vertical='center', wrap_text=True)
+            ws.freeze_panes = 'A2'
+            if ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+            for col_idx, col_cells in enumerate(ws.columns, start=1):
+                header = str(col_cells[0].value)
+                width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 10), 60)
+                if header in ('Status', 'Outage Class'):
+                    for c in col_cells[1:]:
+                        fill = _STATUS_FILLS.get(c.value)
+                        if fill:
+                            c.fill = PatternFill('solid', fgColor=fill)
+    return buf.getvalue()
 
 
 def build_live_disconnected_sites() -> Dict:

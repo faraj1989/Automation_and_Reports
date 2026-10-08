@@ -5,7 +5,7 @@ import shutil
 import sys
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
 from project_config import env_int, env_path_str, env_str, load_env_file
+from backend import device_penetration_processor as device_penetration
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -43,6 +44,17 @@ DOWNLOAD_DIR = env_path_str("WEEKLY_DEVICE_PENETRATION_DOWNLOAD_DIR", str(Path.h
 OUTPUT_DIR = env_path_str("WEEKLY_DEVICE_PENETRATION_OUTPUT_DIR", str(Path.home() / "Downloads" / "Weekly_Device_Penetration_Exports"))
 EXPORT_TASK_TIMEOUT = env_int("WEEKLY_DEVICE_PENETRATION_EXPORT_TASK_TIMEOUT", 300)
 POLL_INTERVAL = env_int("WEEKLY_DEVICE_PENETRATION_POLL_INTERVAL", 15)
+# The CEM and Device Penetration scrapers share one SmartCare account, so the
+# Async Export list holds BOTH scrapers' tasks. Only a task with this name
+# prefix, submitted after this run's own export request, is ours - picking
+# "the newest task" regardless (the old behaviour) let one scraper download
+# the other's export when both ran at once (2026-09-27).
+TASK_NAME_PREFIX = "Device_Penetration_Rate_"
+# Seconds to keep the browser open after a failure for manual inspection.
+# 0 by default: scheduled runs have nobody watching.
+HOLD_BROWSER_SECONDS = env_int("SMARTCARE_HOLD_BROWSER_SECONDS", 0)
+_REQUEST_SKEW = 120  # portal vs. PC clock tolerance when matching our task
+EXPORT_ATTEMPTS = 2  # re-request once if the portal fails the export task
 
 
 def init_driver():
@@ -194,7 +206,10 @@ def find_and_click_query_button(driver):
     """Find and click the Query button with improved iframe handling."""
     print("Looking for Query button...")
 
-    # First, try to find if there's an iframe containing the toolbar
+    # Always start from the top-level document: after a successful click the
+    # driver is left INSIDE iframe 1, and searching for iframes from there
+    # finds none - which made every other refresh fail.
+    driver.switch_to.default_content()
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     print(f"Found {len(iframes)} iframe(s) on the page")
 
@@ -351,7 +366,7 @@ def wait_for_task_completion(driver, task_name, timeout=300):
                                 if "Completed" in status:
                                     print(f"Task '{task_name}' is complete!")
                                     return True
-                                elif "Failed" in status or "Error" in status:
+                                elif "fail" in status.lower() or "error" in status.lower():
                                     print(f"Task '{task_name}' failed with status: {status}")
                                     return False
                                 else:
@@ -437,9 +452,16 @@ def extract_task_rows_from_sweet_grid(driver):
     return task_rows
 
 
-def find_latest_task(driver):
-    """Find the latest task from the list."""
+def find_latest_task(driver, name_prefix=TASK_NAME_PREFIX, not_before=None):
+    """Find the newest task that belongs to this scraper: its name starts
+    with name_prefix and (when not_before is given) it was submitted no
+    earlier than not_before. Returns None rather than falling back to some
+    other scraper's task."""
     task_rows = extract_task_rows_from_sweet_grid(driver)
+    if name_prefix:
+        task_rows = [t for t in task_rows if (t.get('task_name') or '').startswith(name_prefix)]
+    if not_before is not None:
+        task_rows = [t for t in task_rows if t.get('created_at') and t['created_at'] >= not_before]
 
     if not task_rows:
         return None
@@ -544,7 +566,7 @@ def click_task_to_download(driver, latest_task):
         return False
 
 
-def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
+def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT, not_before=None):
     """Find and download the latest export task from the Async Export page."""
     print(f"\n--- STEP 9: Async Export Task Manager ---")
 
@@ -593,11 +615,17 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
 
     print(f"Found {len(task_rows)} task row(s) on Async Export page.")
 
-    # Find the latest task
-    latest_task = find_latest_task(driver)
+    # Find our own latest task (right prefix, submitted after our request)
+    latest_task = find_latest_task(driver, not_before=not_before)
+    if latest_task is None:
+        print("[INFO] Our export task isn't listed yet - refreshing once...")
+        find_and_click_query_button(driver)
+        time.sleep(5)
+        latest_task = find_latest_task(driver, not_before=not_before)
 
     if latest_task is None:
-        print("[ERROR] Could not identify the latest task")
+        print(f"[ERROR] No '{TASK_NAME_PREFIX}*' task submitted after {not_before} found - "
+              "not downloading another scraper's export")
         return False
 
     print(
@@ -618,7 +646,7 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
         completed = wait_for_task_completion(driver, task_name, timeout=300)
 
         if not completed:
-            print(f"[ERROR] Task '{task_name}' did not complete within timeout")
+            print(f"[ERROR] Task '{task_name}' failed on the portal or did not complete within timeout")
             return False
 
         # Refresh the task list after completion
@@ -629,8 +657,8 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
         # Re-find the specific task by name (fresh element references)
         latest_task = find_task_by_name(driver, task_name)
         if latest_task is None:
-            # Fallback: try to grab the latest task by timestamp
-            latest_task = find_latest_task(driver)
+            # Fallback: newest task of OURS by timestamp
+            latest_task = find_latest_task(driver, not_before=not_before)
             if latest_task is None:
                 print("[ERROR] Could not find task after refresh")
                 return False
@@ -658,11 +686,11 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
         return False
 
 
-HISTORICAL_FILENAME = "Weekly_Device_Penetration_Historical.xlsx"
+# Archive format, dedupe identity and weekly reports live in
+# backend/device_penetration_processor.py (shared with the dashboard).
 # Confirmed against a real export: Time, Device Model, Device Brand, Device
 # Type, Device OS, Device Technology, Number of Users(count), Penetration
-# Rate(%) - one row per device model per weekly snapshot Time.
-HISTORY_DEDUPE_COLUMNS = ["Time", "Device Model", "Device Brand", "Device Type", "Device OS", "Device Technology"]
+# Rate(%) - one row per device model per daily snapshot Time, rolling 7 days.
 
 
 def safe_extract_zip(archive: zipfile.ZipFile, destination: Path) -> None:
@@ -700,21 +728,28 @@ def extract_if_zipped(path: Path) -> Path:
     return final_path
 
 
-def fold_into_history(data_file: Path, output_dir: Path) -> Path:
-    """Append this export's rows into one running historical workbook,
-    deduped (by snapshot Time + device identity) so re-processing the same
-    export never double-counts."""
+def fold_into_history(data_file: Path, output_dir: Path) -> pd.DataFrame:
+    """Append this export's rows into the Parquet archive (full history) and
+    the rolling .xlsx mirror, deduped by snapshot Time + device identity so
+    re-processing the same export never double-counts. Refuses anything that
+    isn't a Device Penetration export (e.g. a CEM Comprehensive_Analysis
+    file - what corrupted the history on 2026-09-27)."""
     new_data = pd.read_excel(data_file) if data_file.suffix.lower() in (".xlsx", ".xls") else pd.read_csv(data_file)
-    history_path = Path(output_dir) / HISTORICAL_FILENAME
-    if history_path.exists():
-        combined = pd.concat([pd.read_excel(history_path), new_data], ignore_index=True)
-    else:
-        combined = new_data
-    dedupe_columns = [c for c in HISTORY_DEDUPE_COLUMNS if c in combined.columns] or list(combined.columns)
-    combined = combined.drop_duplicates(subset=dedupe_columns, keep="last")
-    combined.to_excel(history_path, index=False)
-    print(f"Historical dataset updated: {history_path} ({len(combined)} total rows)")
-    return history_path
+    try:
+        new_rows = device_penetration.fold_export(new_data, output_dir)
+    except ValueError as exc:
+        raise ValueError(f"{data_file.name}: {exc}") from exc
+    print(f"Historical dataset updated in {output_dir} ({new_rows['Time'].nunique()} daily snapshots folded)")
+    return new_rows
+
+
+def write_weekly_reports(new_rows: pd.DataFrame, output_dir: Path) -> None:
+    """(Re)generate the weekly report for every week this export touched -
+    a week the previous run only partly covered gets completed here."""
+    history = device_penetration.load_history(output_dir)
+    for path in device_penetration.save_weekly_reports(
+            history, device_penetration.weeks_in(new_rows), output_dir):
+        print(f"Weekly report written: {path}")
 
 
 def cleanup_old_raw_downloads(output_dir: Path, keep: Path) -> None:
@@ -783,7 +818,14 @@ def weekly_device_penetration_automation(download_dir=None, output_dir=None):
         report_details_tab = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'showTab')][@title='Report Details']"))
         )
-        report_details_tab.click()
+        # The dashboard's loading mask can still cover the tab here, which made a
+        # plain .click() fail with "element click intercepted" (2026-09-28).
+        try:
+            WebDriverWait(driver, 90).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.el-loading-mask")))
+        except Exception:
+            print("Loading mask still visible after 90s - clicking via JavaScript anyway.")
+        driver.execute_script("arguments[0].click();", report_details_tab)
         time.sleep(5)
 
         print("Locating and clicking 'Query' button...")
@@ -812,31 +854,53 @@ def weekly_device_penetration_automation(download_dir=None, output_dir=None):
         print("Data rows confirmed. Stabilising...")
         time.sleep(10)
 
-        print("Locating 'Export' icon button...")
-        export_icon = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//i[@title='Export' or contains(@class, 'icon-export')]"))
-        )
-        driver.execute_script("arguments[0].click();", export_icon)
-        time.sleep(3)
+        # The portal sometimes fails an export task outright (status "Fail",
+        # seen 2026-10-01 for both CEM and Device Penetration), so a failed task
+        # is re-requested from the dashboard up to EXPORT_ATTEMPTS times.
+        main_window = driver.current_window_handle
+        downloaded_path = None
+        for attempt in range(1, EXPORT_ATTEMPTS + 1):
+            if attempt > 1:
+                print()
+                print(f"--- Export attempt {attempt}/{EXPORT_ATTEMPTS}: re-requesting the export ---")
+                try:
+                    driver.close()  # the Async Export window from the failed attempt
+                except Exception:
+                    pass
+                driver.switch_to.window(main_window)
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                if iframes:
+                    driver.switch_to.frame(iframes[1 if len(iframes) >= 2 else 0])
+                    time.sleep(3)
+                wait = WebDriverWait(driver, 45)
 
-        print("Selecting 'Excel(All Data)' from dropdown...")
-        excel_all_option = wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//li[contains(@class,'el-dropdown-menu__item')][contains(text(),'Excel(All Data)')]")
+            print("Locating 'Export' icon button...")
+            export_icon = wait.until(
+                EC.presence_of_element_located((By.XPATH, "//i[@title='Export' or contains(@class, 'icon-export')]"))
             )
-        )
-        driver.execute_script("arguments[0].click();", excel_all_option)
-        print("Export task successfully requested!")
-        time.sleep(10)
+            driver.execute_script("arguments[0].click();", export_icon)
+            time.sleep(3)
 
-        print("Opening a separate Chrome window for Async Export Task Manager...")
-        driver = open_task_manager_window(driver)
+            print("Selecting 'Excel(All Data)' from dropdown...")
+            excel_all_option = wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//li[contains(@class,'el-dropdown-menu__item')][contains(text(),'Excel(All Data)')]")
+                )
+            )
+            request_time = datetime.now()
+            driver.execute_script("arguments[0].click();", excel_all_option)
+            print(f"Export task successfully requested at {request_time:%Y-%m-%d %H:%M:%S}!")
+            time.sleep(10)
 
-        # Create a new wait object for the new window
-        wait = WebDriverWait(driver, 45)
+            print("Opening a separate Chrome window for Async Export Task Manager...")
+            driver = open_task_manager_window(driver)
+            wait = WebDriverWait(driver, 45)
 
-        # Find and download the task
-        downloaded_path = find_and_download_task(driver, wait)
+            # Find and download OUR task (prefix + submitted after our request)
+            downloaded_path = find_and_download_task(
+                driver, wait, not_before=request_time - timedelta(seconds=_REQUEST_SKEW))
+            if downloaded_path:
+                break
 
         if downloaded_path:
             source = Path(downloaded_path)
@@ -851,21 +915,29 @@ def weekly_device_penetration_automation(download_dir=None, output_dir=None):
 
             try:
                 data_file = extract_if_zipped(destination)
-                fold_into_history(data_file, OUTPUT_DIR)
+                new_rows = fold_into_history(data_file, OUTPUT_DIR)
                 cleanup_old_raw_downloads(OUTPUT_DIR, keep=data_file)
             except Exception as exc:
+                new_rows = None
                 print(f"[WARN] Post-download processing (unzip/history/cleanup) failed: {exc}")
+            if new_rows is not None:
+                try:
+                    write_weekly_reports(new_rows, Path(OUTPUT_DIR))
+                except Exception as exc:
+                    print(f"[WARN] Weekly report generation failed (history is saved): {exc}")
         else:
             print("\n[WARN] Automation finished but the file may not have downloaded. Check the browser window.")
-            print("[INFO] Holding browser open for 5 minutes for manual inspection...")
-            time.sleep(300)
+            if HOLD_BROWSER_SECONDS:
+                print(f"[INFO] Holding browser open {HOLD_BROWSER_SECONDS}s for manual inspection...")
+                time.sleep(HOLD_BROWSER_SECONDS)
 
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Automation sequence broken: {e}")
         import traceback
         traceback.print_exc()
-        print("[INFO] Holding browser open for 5 minutes for manual inspection...")
-        time.sleep(300)
+        if HOLD_BROWSER_SECONDS:
+            print(f"[INFO] Holding browser open {HOLD_BROWSER_SECONDS}s for manual inspection...")
+            time.sleep(HOLD_BROWSER_SECONDS)
 
     finally:
         print("Closing browser session.")

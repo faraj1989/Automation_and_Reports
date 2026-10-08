@@ -25,6 +25,8 @@ SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
 RECOVERABLE_EXTENSIONS = SUPPORTED_EXTENSIONS | {".zip"}
 COMPREHENSIVE_PREFIX = "Comprehensive_Analysis"
 PROCESSED_LEDGER_FILENAME = "processed_files_ledger.json"
+EXPORT_ROW_CAP = 100_000     # SmartCare's hard limit per Excel(All Data) export
+MIN_DAY_ROWS_SHARE = 0.9     # never replace a stored day with one that has <90% of its rows
 
 # =============================================================
 # CENTRALIZED DIRECTORIES (from GUI)
@@ -126,13 +128,17 @@ def build_top10_weekly_applications(top100_df: pd.DataFrame, top_n: int = 10) ->
     total here, same as it wouldn't show up in the Top100 sheet itself.
     Week = the Monday that starts each date's ISO week, so weeks sort and
     group the same way regardless of which day of the week a report runs."""
-    columns = ["week", "week_number", "application", "total_traffic_bytes", "total_traffic_gb"]
+    columns = ["week", "week_number", "days_in_week", "application", "total_traffic_bytes", "total_traffic_gb"]
     if top100_df.empty:
         return pd.DataFrame(columns=columns)
     working = top100_df.copy()
     parsed_date = pd.to_datetime(working["date"], errors="coerce")
     working["week"] = (parsed_date - pd.to_timedelta(parsed_date.dt.weekday, unit="D")).dt.strftime("%Y-%m-%d")
     weekly = working.groupby(["week", "application"], dropna=False, as_index=False)["total_traffic_bytes"].sum()
+    # How many days of data each week's totals are built from - a week with
+    # missing days (export gaps) has smaller totals and must not be read as a
+    # real week-over-week drop.
+    weekly["days_in_week"] = weekly["week"].map(working.groupby("week")["date"].nunique()).astype(int)
     weekly["total_traffic_gb"] = weekly["total_traffic_bytes"] / 1024 ** 3
     # ISO week number of the week-start date - repeats every year, but this
     # archive only spans one, so a bare number (not "YYYY-Www") stays readable.
@@ -172,8 +178,37 @@ def build_rate_metrics(df: pd.DataFrame) -> pd.DataFrame:
             downlink_tcp_packet_loss_rate=("downlink_tcp_packet_loss_rate", "mean"),
             tcp_connection_success_rate_included_rst=("tcp_connection_success_rate_included_rst", "mean"),
             total_traffic_gb=("total_traffic_gb", "sum"),
+            source_rows=("date", "size"),
         )
     )
+
+    # The rate columns above are a plain mean across ~3,800 application rows
+    # per day, so thousands of tiny apps outweigh Facebook/TikTok/YouTube and
+    # e.g. DL retransmission reads ~3x worse than users actually see (2.8% vs
+    # 0.8%, 2026-09-28..10-04). Kept unchanged for trend continuity (days
+    # before 2026-08-06 have no raw export left to recompute); these
+    # *_weighted columns are the network-true figures. Packet-based rates are
+    # weighted by downlink packets (rate = lost/retransmitted packets / packets,
+    # so this is exact for the DL rates and the closest available proxy for the
+    # UL+DL average); connection success rates by traffic, since connection
+    # counts aren't in the export.
+    packets = pd.to_numeric(df.get("downlink_packets_packets"), errors="coerce") \
+        if "downlink_packets_packets" in df.columns else None
+    weights = {
+        "tcp_connection_success_rate": rates["total_traffic_bytes"],
+        "tcp_connection_success_rate_included_rst": rates["total_traffic_bytes"],
+        "downlink_tcp_retransmission_rate": packets,
+        "average_tcp_packet_loss_rate": packets,
+        "downlink_tcp_packet_loss_rate": packets,
+    }
+    for col, w in weights.items():
+        if w is None:
+            continue
+        w = w.reindex(rates.index).fillna(0)
+        ok = rates[col].notna() & (w > 0)
+        num = (rates[col] * w).where(ok, 0).groupby(rates["date"]).sum()
+        den = w.where(ok, 0).groupby(rates["date"]).sum()
+        daily[f"{col}_weighted"] = daily["date"].map(num / den.replace(0, pd.NA))
 
     return daily
 
@@ -349,6 +384,23 @@ def save_historical_archive(history_path: Path, top100_df: pd.DataFrame, metrics
     existing_top100 = load_existing_excel_sheet(history_path, "Top100 per day", legacy_name="Top100")
     existing_metrics = load_existing_excel_sheet(history_path, "Metrics")
 
+    # Never replace a stored day with a clearly smaller (partial) version of it.
+    # Only comparable when the stored day recorded its source_rows (days
+    # archived before 2026-10-06 didn't).
+    if (not existing_metrics.empty and "source_rows" in existing_metrics.columns
+            and "source_rows" in metrics_df.columns):
+        stored = existing_metrics.assign(date=existing_metrics["date"].astype(str)) \
+            .dropna(subset=["source_rows"]).set_index("date")["source_rows"]
+        new_rows = metrics_df.assign(date=metrics_df["date"].astype(str)).set_index("date")["source_rows"]
+        keep_stored = [d for d, n in new_rows.items()
+                       if d in stored.index and n < MIN_DAY_ROWS_SHARE * stored[d]]
+        if keep_stored:
+            logging.getLogger("download-analysis").warning(
+                f"Kept the stored version of {keep_stored}: this export has <{MIN_DAY_ROWS_SHARE:.0%} "
+                f"of the rows for those day(s), i.e. they look partial")
+            top100_df = top100_df[~top100_df["date"].astype(str).isin(keep_stored)]
+            metrics_df = metrics_df[~metrics_df["date"].astype(str).isin(keep_stored)]
+
     date_values = set(top100_df["date"].astype(str).unique())
     if not existing_top100.empty and "date" in existing_top100.columns:
         existing_top100 = existing_top100[~existing_top100["date"].astype(str).isin(date_values)]
@@ -422,6 +474,17 @@ def process_data_file(file_path: Path, output_dir: Path, history_path: Path, log
     logger.info(f"Processing {file_path}")
     df = load_dataframe(file_path)
     cleaned_df = clean_dataframe(df)
+
+    # SmartCare cuts every export at EXPORT_ROW_CAP rows (~26 days at ~3,850
+    # rows/day). An export that hit the cap stops mid-day, so its last day is
+    # partial - drop it rather than let it replace a complete stored day
+    # (what happened to 2026-09-01 on 2026-10-06).
+    if len(cleaned_df) >= EXPORT_ROW_CAP:
+        day = parse_time_column(cleaned_df)
+        last_day = day.dropna().max()
+        cleaned_df = cleaned_df[day != last_day]
+        logger.warning(f"{file_path.name} hit the {EXPORT_ROW_CAP:,}-row export cap - dropped its last, "
+                       f"partial day {last_day}. Export long ranges in chunks of <= 25 days.")
     top100_df = build_top100_traffic(cleaned_df)
     metrics_df = build_rate_metrics(cleaned_df)
 
@@ -527,8 +590,10 @@ def discover_files(input_dir: Path) -> List[Path]:
     if not candidates:
         return []
 
-    # Return all found files, sorted by modification time (newest first)
-    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    # Oldest first: each processed export REPLACES the days it covers in the
+    # history, so the newest export must be processed last to win (newest-first
+    # let an older export overwrite a newer one's days).
+    return sorted(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def write_manifest(output_root: Path, processed_files: List[dict]) -> None:

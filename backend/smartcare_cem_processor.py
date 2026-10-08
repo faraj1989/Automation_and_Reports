@@ -95,6 +95,124 @@ def top_apps_for_date(top100_df: pd.DataFrame, target_date, n: int = 10) -> pd.D
     return day.sort_values(sort_col, ascending=False).head(n)
 
 
+# ----------------------------------------------------------------------
+# Monthly Comprehensive Analysis (Tripoli HQ) - the same 3 sheets as the
+# history workbook, restricted to one calendar month. HQ asks for it at the
+# start of each month; built on demand from the HQ Reports tab and
+# automatically on the 2nd (scheduler.py --cem-monthly).
+# ----------------------------------------------------------------------
+
+MONTHLY_REPORT_DIR = os.environ.get(
+    "CEM_MONTHLY_REPORT_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(CEM_WORKBOOK_PATH)), "Monthly_CEM_Reports"),
+)
+# HQ's Metrics format - the original 7 columns only (the *_weighted and
+# source_rows columns stay in the internal history workbook).
+HQ_METRICS_COLUMNS = [
+    'date', 'tcp_connection_success_rate', 'downlink_tcp_retransmission_rate',
+    'average_tcp_packet_loss_rate', 'downlink_tcp_packet_loss_rate',
+    'tcp_connection_success_rate_included_rst', 'total_traffic_gb',
+]
+# Informational only: days with <85% of the month's typical row count. Cut-off
+# days of 100,000-row exports are already dropped by the pipeline before they
+# reach the history, and some real days are just smaller (e.g. 2026-08-08/09
+# had ~3,450 rows in every export that covered them), so this never makes a
+# month "incomplete" - it's shown so a human can eyeball it.
+LOW_ROWS_DAY_SHARE = 0.85
+
+
+def _month_bounds(month: str):
+    start = pd.Timestamp(f"{month}-01")
+    return start, start + pd.offsets.MonthEnd(0)
+
+
+def monthly_report_filename(month: str) -> str:
+    """'2026-09' -> 'Comprehensive_Analysis_Historical - ONLY -SEP-2026.xlsx'
+    (the naming HQ already receives)."""
+    start, _ = _month_bounds(month)
+    return f"Comprehensive_Analysis_Historical - ONLY -{start.strftime('%b').upper()}-{start.year}.xlsx"
+
+
+def _load_history_sheets():
+    xl = pd.ExcelFile(CEM_WORKBOOK_PATH)
+    top100 = xl.parse('Top100 per day')
+    metrics = xl.parse('Metrics')
+    for df in (top100, metrics):
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+    return top100, metrics
+
+
+def available_months() -> list:
+    """Months (YYYY-MM, newest first) with at least one day in the history."""
+    if not is_available():
+        return []
+    _, metrics = _load_history_sheets()
+    return sorted(metrics['date'].dropna().str[:7].unique().tolist(), reverse=True)
+
+
+def month_completeness(month: str, metrics: Optional[pd.DataFrame] = None) -> Dict:
+    """Which days of the month are present, missing, or look partial."""
+    if metrics is None:
+        _, metrics = _load_history_sheets()
+    start, end = _month_bounds(month)
+    all_days = pd.date_range(start, end).strftime('%Y-%m-%d').tolist()
+    m = metrics[metrics['date'].str[:7] == month]
+    present = sorted(set(m['date']))
+    low_rows = []
+    if 'source_rows' in m.columns and m['source_rows'].notna().any():
+        typical = m['source_rows'].median()
+        low_rows = sorted(m.loc[m['source_rows'] < LOW_ROWS_DAY_SHARE * typical, 'date'].tolist())
+    missing = [d for d in all_days if d not in set(present)]
+    return {
+        'month': month,
+        'days_in_month': len(all_days),
+        'present': present,
+        'missing': missing,
+        'low_rows': low_rows,
+        'complete': not missing,
+    }
+
+
+def build_monthly_cem_workbook(month: str):
+    """(xlsx bytes, filename, completeness dict) for one month: Top100 per
+    day, Top10 Application per week (re-rolled from THIS month's days only,
+    with days_in_week so a week cut by the month boundary is visible), and
+    Metrics (HQ's 7 columns)."""
+    import io
+    from reports.download_analysis_pipeline import build_top10_weekly_applications
+    from backend.report_generator import autofit_excel_columns
+
+    top100, metrics = _load_history_sheets()
+    top = top100[top100['date'].str[:7] == month].copy()
+    met = metrics[metrics['date'].str[:7] == month].copy()
+    info = month_completeness(month, metrics)
+
+    # Sort orders match the reference file HQ received for 2026-09: Top100
+    # newest day first; weekly and Metrics oldest first.
+    top = top.sort_values(['date', 'total_traffic_bytes'], ascending=[False, False])
+    weekly = build_top10_weekly_applications(top).sort_values(
+        ['week', 'total_traffic_bytes'], ascending=[True, False])
+    met = met[[c for c in HQ_METRICS_COLUMNS if c in met.columns]].sort_values('date')
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        for name, df in [('Top100 per day', top), ('Top10 Application per week', weekly), ('Metrics', met)]:
+            df.to_excel(writer, sheet_name=name, index=False)
+            writer.sheets[name].auto_filter.ref = writer.sheets[name].dimensions
+        autofit_excel_columns(writer)
+    return buf.getvalue(), monthly_report_filename(month), info
+
+
+def save_monthly_cem_report(month: str, out_dir: str = MONTHLY_REPORT_DIR):
+    """Write the month's workbook to out_dir; returns (path, completeness)."""
+    data, filename, info = build_monthly_cem_workbook(month)
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    with open(path, 'wb') as f:
+        f.write(data)
+    return path, info
+
+
 # ---------------------------- Test ----------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

@@ -236,6 +236,7 @@ def process_user_kpis(day_folder, log_callback=None):
                             log(f"   ⚠️ Found {dup_count} duplicate rows, removing")
                             df = df.drop_duplicates(subset=['Date'])
 
+                    df.attrs['source_file'] = os.path.basename(file_path)  # lineage for the history audit log
                     results[sheet_name] = df
                     log(f"   ✅ Loaded {len(df)} rows, {len(df.columns)} columns")
                     if 'Date' in df.columns:

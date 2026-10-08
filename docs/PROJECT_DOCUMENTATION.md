@@ -96,7 +96,7 @@ This module (rewritten 2026-09-10 to be fully self-contained — it originally r
 ### 3.4 CEM and Device Penetration readers
 
 - **`backend/smartcare_cem_processor.py`** reads `Processed_Analysis/Comprehensive_Analysis_Historical.xlsx` (3 sheets: `Top100 per day`, `Top10 Application per week`, `Metrics` — TCP connection quality/traffic volume trend). Feeds the 📱 CEM tab's "App Traffic & Quality" sub-tab.
-- **`backend/device_penetration_processor.py`** reads `Weekly_Device_Penetration_Exports/Weekly_Device_Penetration_Historical.xlsx`. Feeds the 📱 CEM tab's "Device Mix" sub-tab.
+- **`backend/device_penetration_processor.py`** reads `Weekly_Device_Penetration_Exports/Weekly_Device_Penetration_Historical.xlsx`. Feeds the 📱 CEM tab's "Device Penetration" sub-tab.
 - Both are "stale after N days" aware (`*_STALE_DAYS`) and degrade to an info message rather than erroring if the file is missing or old.
 
 ## 4. Backend KPI processors (SFTP-fed)
@@ -110,7 +110,7 @@ Each reads specific file-pattern(s) from `<local_root>/<date>/unzipped/`, return
 | `network_kpi_processor.py` | `* (2G/3G/4G-NWBH).csv`, `* (2G/3G/4G-NW_Daily).csv`, `*Gi Interface Traffic*.csv` | whole-network busy-hour/daily KPIs | `2G_NWBH.csv`, `2G_NW_Daily.csv`, `3G_NWBH.csv`, `3G_NW_Daily.csv`, `4G_NWBH.csv`, `4G_NW_Daily.csv`, `Gi_Interface_Traffic.csv` |
 | `cell_kpi_processor.py` | `* (2G cell-CSBH).csv`, `* (3G-cells -CSBH).csv`, `* (4G cell-BH).csv` | per-cell busy-hour KPIs | `2G_Cell_CSBH.csv`, `3G_Cell_CSBH.csv`, `4G_Cell_BH.csv` |
 | `hourly_cell_processor.py` | `*all last hours all cells level*.csv` (3 files inside, identified by header column `GBSC`/`RNC`/`eNodeB Name`, not filename) | full hourly grain, no aggregation | `2G_Cell_Hourly.csv`, `3G_Cell_Hourly.csv`, `4G_Cell_Hourly.csv` (90-day retention, excluded from the combined Excel export) |
-| `transmission_kpi_processor.py` | `*BSC6900*PACKETLOSS*.csv` (IUB/ABIS backhaul, ~260k rows/day) | `T7816`/`T7817` packet loss, `T7812`/`T7813` delay | `Transmission_KPIs.csv` + `Packet_Loss.csv` (aggregated to 1 row/link/day: mean for averages, max for maxima) |
+| `transmission_kpi_processor.py` | `*BSC6900*PACKETLOSS*.csv` (IUB/ABIS backhaul, ~260k rows/day) | `T7816`/`T7817` packet loss, `T7812`/`T7813` delay | Via `packet_loss_engine.py`: `Transmission_KPIs.csv` (1 row/link/day, key Date+GBSC+ID - IDs repeat across BSCs), `Packet_Loss_Site_Daily.csv` (1 row/site/day: loss/minor/no-response/high-delay/hub-event hour counts - permanent), `Packet_Loss_Hub_Events.csv` (FN/HUB shared-path events per day), `Packet_Loss_Site_Hourly.csv` (31-day rolling drill-down). Complete past days only; each run replaces the 7 dates it covers. Rebuild all history: `python -m backend.transmission_kpi_processor "<FTP root>" --backfill` |
 | `traffic_kpi_processor.py` | `* (PS Traffic 2G/3G/4G).csv` | `PS Traffic(GB)`, `CS Traffic`, `VoLTE Traffic Volume (Erl)` | `Traffic_2G/3G/4G.csv` (per-site), `Traffic_Network_2G/3G/4G.csv` (whole-network) |
 | `user_kpi_processor.py` | `* (CS Roaming users).csv`, `* (MSC Server KPI-CS Subscribers+total).csv`, `* (PS Roaming users).csv`, `* (PS users (2G-3G-4G)).csv`, `* (VoLTE users).csv` | daily MAX per KPI | `User_CS_Roaming.csv`, `User_CS_Subscribers.csv`, `User_PS_Roaming.csv`, `User_PS_Subscribers.csv`, `User_VoLTE.csv`, consolidated `User_Summary.csv` |
 | `interference_processor.py` | `*interference*PRB*utilization*Automation*.csv` (weekly Huawei upload, 3 files inside identified by header column) | `Interference Band Proportion (4~5)(%)` (2G), `VS.MeanRTWP` (3G), `L.UL.Interference.Avg(dBm)` (4G) | `2G_Interference.csv`, `3G_Interference_Hourly.csv` + `3G_Interference_Daily.csv` rollup, `4G_Interference_Hourly.csv` + `4G_Interference_Daily.csv` rollup |
@@ -148,9 +148,9 @@ Top-level sections, in order:
 1. **📊 Overview** — Site Summary, Executive Summary
 2. **📡 KPIs & Performance** — Scorecards, Worst Cells, Traffic & Capacity, 14-Day Trend, Data Freshness (each split further by 2G/3G/4G)
 3. **🏗️ Sites & Infrastructure** — Site Health & Topology, Site Inventory, Site Detail, EPT
-4. **📶 Packet Loss** — Day / Last 7 Days / Last 30 Days
-5. **🚨 Alarms** — live "Currently Disconnected Sites" + metric tiles, historical rollups (Chronic Offenders / Site Downtime / Daily Trend / Category Rollup), and a date-picker-driven "Daily NOC Alarm Analysis" with a Word-export button
-6. **📱 CEM** — App Traffic & Quality, Device Mix
+4. **📶 Packet Loss** — Network view (Day / 7 / 30 days / custom: class tiles, affected-site ranking by loss hours with suspected cause + hour-by-hour drill-down heatmap, FN/HUB shared-path events, network trend, core links & not-reporting) and Special report (pick sites / whole FN-HUB node / region + date range + label). Excel and Word export on both. Logic in `backend/packet_loss_engine.py`, thresholds in `config/packet_loss_rules.csv`
+5. **🚨 Alarms** — live "Currently Disconnected Sites" + metric tiles, historical rollups (Chronic Offenders / Site Downtime / Daily Trend / Category Rollup), and a date-range-driven "Daily NOC Alarm Analysis": per-site Status (Cleared / Not Cleared / Unknown - historical exports only hold cleared alarms, so still-open ones come from the live feed, and a stale live snapshot gives Unknown), Outage Class (Long-Term Outage = an outage of `LONG_TERM_OUTAGE_DAYS`, 7, or more days, optionally excluded from KPIs), per-event list, daily summary, active outages, data-quality per day, combinable filters, and a formatted 5-sheet Excel workbook + Word export
+6. **📱 CEM** — App Traffic & Quality, Device Penetration
 7. **🔎 Investigate** — Cell Explorer, Special Reports
 8. **📋 HQ Reports** — NQ Data Collection Template (own sub-tabs per sheet), Traffic & Availability (Tripoli HQ)
 9. **📧 Reports** — Report & Export

@@ -20,6 +20,12 @@ OUTPUT_FOLDER = "output"
 CSV_FOLDER = os.path.join(OUTPUT_FOLDER, "csv")
 
 
+def _today():
+    """Current business date - the first date whose data is still incomplete.
+    A function (not inline datetime.now()) so tests can simulate other days."""
+    return datetime.now().date()
+
+
 class CSVHistoryManager:
     """
     Manages historical data as CSV files.
@@ -29,6 +35,9 @@ class CSVHistoryManager:
     def __init__(self, output_folder=OUTPUT_FOLDER):
         self.output_folder = output_folder
         self.csv_folder = os.path.join(output_folder, "csv")
+        # Kept OUTSIDE csv/ so export_to_excel (which exports every csv/*.csv)
+        # doesn't pick it up as a KPI sheet
+        self.audit_log_path = os.path.join(output_folder, "history_audit", "kpi_value_changes.csv")
         self._ensure_folders()
 
     def _normalize_date(self, date_value):
@@ -169,7 +178,127 @@ class CSVHistoryManager:
             logger.error(f"Failed to append to {sheet_name}: {e}")
             raise
 
-        
+    def _upsert_complete_days(self, sheet_name, df, key_cols, date_col='Date', source=None):
+        """
+        Merge df into the sheet so that only complete business days are stored,
+        and a later export of an already-stored day REPLACES the stored row.
+
+        Principle: raw source exports may contain partial/current-day records;
+        KPI history must contain only complete business days.
+
+        For whole-network and user feeds that Huawei re-exports over a rolling
+        window every run:
+        - The 06:00 run's export also covers today's first hours (00:00-05:00),
+          so it carries an incomplete "today" row: a busy-hour picked from
+          the night hours or a max-users taken over ~3 hours. A day is only
+          complete once it's over, so rows dated today or later are never
+          stored (and any stored by an older run are purged).
+        - Old counters get revised after the first export (late-arriving
+          unavailability durations, NIL KPIs that fill in later). The later
+          export of a complete day replaces the stored row, instead of
+          first-write-wins freezing the stale value forever. Every value that
+          changes this way is recorded in the audit log (see _log_value_changes).
+        Returns (rows_in_new_export, rows_dropped_as_incomplete)
+        """
+        if df is None or df.empty:
+            return 0, 0
+
+        source = source or df.attrs.get('source_file', '')
+        today = pd.Timestamp(_today())
+        df = df.copy()
+        dropped = 0
+        if date_col in df.columns:
+            dates = pd.to_datetime(df[date_col], errors='coerce', format='mixed')
+            df[date_col] = dates.dt.strftime('%Y-%m-%d')
+            incomplete = dates.dt.normalize() >= today
+            dropped = int(incomplete.sum())
+            if dropped:
+                logger.info(f"{sheet_name}: dropped {dropped} incomplete row(s) dated today or later")
+            undated = dates.isna()
+            if undated.any():
+                # Can't place it on a business day, so it can't be a complete one
+                logger.warning(f"{sheet_name}: dropped {int(undated.sum())} row(s) with unparsable {date_col}")
+            df = df[~incomplete & ~undated]
+
+        existing_df = self._read_csv(sheet_name)
+        if existing_df.empty:
+            if not df.empty:
+                self._write_csv(sheet_name, df)
+            return len(df), dropped
+
+        keys = [c for c in key_cols if c in existing_df.columns and (df.empty or c in df.columns)]
+        if not keys:
+            logger.warning(f"{sheet_name}: no key columns for upsert, falling back to append-only")
+            return self._append_with_dup_check(sheet_name, df, key_cols)[0], dropped
+
+        if date_col in existing_df.columns:
+            existing_df[date_col] = pd.to_datetime(existing_df[date_col], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
+        for frame in (existing_df, df):
+            for c in keys:
+                if c in frame.columns:
+                    frame[c] = frame[c].astype(str)
+        if not df.empty:
+            self._log_value_changes(sheet_name, existing_df, df, keys, source)
+
+        combined = pd.concat([existing_df, df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=keys, keep='last')
+        if date_col in combined.columns:
+            # Also purge any incomplete-today row stored by an older run
+            stale_today = pd.to_datetime(combined[date_col], errors='coerce', format='mixed') >= today
+            if stale_today.any():
+                logger.info(f"{sheet_name}: purged {int(stale_today.sum())} previously-stored incomplete row(s)")
+            combined = combined[~stale_today].sort_values(date_col, kind='stable')
+        self._write_csv(sheet_name, combined.reset_index(drop=True))
+        logger.info(f"{sheet_name}: upserted {len(df)} complete-day rows from latest export")
+        return len(df), dropped
+
+    def _log_value_changes(self, sheet_name, existing_df, new_df, keys, source):
+        """Append one audit row per (key, column) whose stored value is about to
+        be replaced by a different value from a later export - the lineage
+        answer to "why did 9/28 VoLTE change from 385 to 604 Erl?"."""
+        try:
+            cols = [c for c in new_df.columns if c in existing_df.columns and c not in keys]
+            if not cols:
+                return
+            old = existing_df.drop_duplicates(subset=keys, keep='last')[keys + cols]
+            m = old.merge(new_df.drop_duplicates(subset=keys, keep='last')[keys + cols],
+                          on=keys, suffixes=('__old', '__new'))
+            if m.empty:
+                return
+            changes = []
+            for c in cols:
+                o, n = m[c + '__old'], m[c + '__new']
+                on, nn = pd.to_numeric(o, errors='coerce'), pd.to_numeric(n, errors='coerce')
+                numeric = on.notna() | nn.notna()
+                both_nan = o.isna() & n.isna()
+                same_num = (on - nn).abs() <= 1e-9 + 1e-6 * nn.abs()
+                num_diff = numeric & ~same_num & ~both_nan
+                # Non-numeric (e.g. "Integrity" 98% -> 99%): plain string compare
+                str_diff = ~numeric & (o.astype(str) != n.astype(str)) & ~both_nan
+                diff = num_diff | str_diff
+                if diff.any():
+                    part = m.loc[diff, keys].copy()
+                    part['Column'] = c
+                    part['Old Value'] = o[diff].values
+                    part['New Value'] = n[diff].values
+                    changes.append(part)
+            if not changes:
+                return
+            log_df = pd.concat(changes, ignore_index=True)
+            log_df['Key'] = log_df[keys].astype(str).agg(' | '.join, axis=1)
+            log_df.insert(0, 'Sheet', sheet_name)
+            log_df.insert(0, 'Ingested At', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            log_df['Source'] = source
+            log_df = log_df[['Ingested At', 'Sheet', 'Key', 'Column', 'Old Value', 'New Value', 'Source']]
+            os.makedirs(os.path.dirname(self.audit_log_path), exist_ok=True)
+            log_df.to_csv(self.audit_log_path, mode='a', index=False,
+                          header=not os.path.exists(self.audit_log_path))
+            logger.info(f"{sheet_name}: {len(log_df)} stored value(s) revised by later export "
+                        f"({log_df['Key'].nunique()} day(s)) - logged to {self.audit_log_path}")
+        except Exception as e:
+            # Audit is best-effort; never block the history update over it
+            logger.warning(f"{sheet_name}: could not write value-change audit: {e}")
+
     def update_site_row(self, row_dict):
         """
         Update or append a row to SiteSummary CSV.
@@ -276,6 +405,11 @@ class CSVHistoryManager:
             # First run under this tracking scheme - no real history to
             # backfill, so start the clock now rather than fabricate a date.
             existing_df['Last Updated'] = target_date
+        else:
+            # Keep one ISO format - a past hand-edit/Excel save left some
+            # rows as "8/18/2026", which sorts and compares wrongly.
+            parsed = pd.to_datetime(existing_df['Last Updated'], format='mixed', errors='coerce')
+            existing_df['Last Updated'] = parsed.dt.strftime('%Y-%m-%d').where(parsed.notna(), existing_df['Last Updated'])
         existing_by_site = existing_df.set_index('Site Name')
 
         all_sites = list(existing_by_site.index) + [s for s in new_df.index if s not in existing_by_site.index]
@@ -327,7 +461,7 @@ class CSVHistoryManager:
         for sheet_name, df in results_dict.items():
             if df is not None and not df.empty:
                 key_cols = ['Date', 'Whole Network']
-                new_count, skipped_count = self._append_with_dup_check(sheet_name, df, key_cols)
+                new_count, skipped_count = self._upsert_complete_days(sheet_name, df, key_cols)
                 total_new += new_count
                 total_skipped += skipped_count
 
@@ -353,25 +487,49 @@ class CSVHistoryManager:
         logger.info(f"Cell KPIs: {total_new} new rows, {total_skipped} skipped")
         return total_new, total_skipped
 
-    def update_transmission_kpis(self, results_dict):
-        """Update all Transmission KPI CSVs (already aggregated to one row
-        per link per day by transmission_kpi_processor.py)."""
+    def update_transmission_kpis(self, results_dict, hourly_retention_days=None):
+        """Update the packet-loss archives built by transmission_kpi_processor.py
+        (Transmission_KPIs / Packet_Loss_Site_Daily / Packet_Loss_Hub_Events /
+        Packet_Loss_Site_Hourly).
+
+        The raw export is a rolling 7-day window and the processor only hands
+        over complete past days, so for the daily sheets every date in the new
+        batch REPLACES that date's stored rows (the export is the source of
+        truth for the days it covers - a revised counter or a changed hub-event
+        attribution lands, and rows stored under the old Date+ID-only key, which
+        merged links sharing an ID across BSCs, are cleaned out). The hourly
+        sheet is deduplicated on Time+Site and trimmed to its retention."""
         if not results_dict:
-            return
+            return 0, 0
+        if hourly_retention_days is None:
+            from backend.packet_loss_engine import load_rules
+            hourly_retention_days = load_rules()['hourly_retention_days']
 
+        today = pd.Timestamp(_today()).strftime('%Y-%m-%d')
         total_new = 0
-        total_skipped = 0
-
         for sheet_name, df in results_dict.items():
-            if df is not None and not df.empty:
-                key_cols = ['Date', 'Adjacent Node ID']
-                new_count, skipped_count = self._append_with_dup_check(sheet_name, df, key_cols)
-                total_new += new_count
-                total_skipped += skipped_count
-                logger.info(f"Transmission KPI {sheet_name}: {new_count} new rows, {skipped_count} skipped")
+            if df is None or df.empty:
+                continue
+            existing = self._read_csv(sheet_name)
+            if sheet_name == 'Packet_Loss_Site_Hourly':
+                df = df[df['Time'].str[:10] < today]
+                combined = pd.concat([existing, df], ignore_index=True) if not existing.empty else df.copy()
+                combined = combined.drop_duplicates(subset=['Time', 'Site'], keep='last')
+                times = pd.to_datetime(combined['Time'], errors='coerce')
+                combined = combined[times >= times.max().normalize() - pd.Timedelta(days=hourly_retention_days - 1)]
+                combined = combined.sort_values(['Time', 'Site'])
+            else:
+                df = df[df['Date'].astype(str) < today]
+                if not existing.empty and 'Date' in existing.columns:
+                    existing['Date'] = pd.to_datetime(existing['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    existing = existing[~existing['Date'].isin(set(df['Date']))]
+                combined = pd.concat([existing, df], ignore_index=True) if not existing.empty else df.copy()
+                combined = combined.sort_values('Date', kind='stable')
+            self._write_csv(sheet_name, combined.reset_index(drop=True))
+            total_new += len(df)
+            logger.info(f"Packet loss {sheet_name}: {len(df)} row(s) from export -> {len(combined)} stored")
 
-        logger.info(f"Transmission KPIs: {total_new} new rows, {total_skipped} skipped")
-        return total_new, total_skipped
+        return total_new, 0
 
     def update_hourly_cell_kpis(self, results_dict, retention_days=90):
         """Update the hourly all-cells CSVs (2G_Cell_Hourly/3G_Cell_Hourly/
@@ -515,15 +673,6 @@ class CSVHistoryManager:
             logger.error(f"Failed to update UserKPIs: {e}")
             raise
 
-    def update_packet_loss(self, df):
-        """Update Packet Loss CSV."""
-        if df is None or df.empty:
-            return
-
-        key_cols = ['Date', 'GBSC', 'Adjacent Node Name', 'Adjacent Node Type', 'Adjacent Node ID']
-        self._append_with_dup_check('Packet_Loss', df, key_cols)
-        logger.info(f"Updated Packet_Loss with {len(df)} rows")
-
     def update_noc_daily_alarm_summary(self, df):
         """Archive one day's down-site NOC alarm analysis (backend.noc_alarm_processor.
         build_daily_noc_alarm_report's 'down_sites_summary' - one row per site that
@@ -565,15 +714,15 @@ class CSVHistoryManager:
             if df is not None and not df.empty:
                 # Use Date as key column
                 key_cols = ['Date']
-                new_count, skipped_count = self._append_with_dup_check(sheet_name, df, key_cols)
+                new_count, skipped_count = self._upsert_complete_days(sheet_name, df, key_cols)
                 total_new += new_count
                 total_skipped += skipped_count
-                logger.info(f"User KPI {sheet_name}: {new_count} new rows, {skipped_count} skipped")
+                logger.info(f"User KPI {sheet_name}: {new_count} rows upserted, {skipped_count} incomplete dropped")
 
         logger.info(f"User KPIs updated: {total_new} new rows, {total_skipped} duplicates skipped")
         return total_new, total_skipped
 
-    def update_user_summary(self, df):
+    def update_user_summary(self, df, source=None):
         """
         Update the consolidated user summary sheet.
         """
@@ -582,7 +731,7 @@ class CSVHistoryManager:
 
         self._ensure_folders()
         key_cols = ['Date']
-        self._append_with_dup_check('User_Summary', df, key_cols)
+        self._upsert_complete_days('User_Summary', df, key_cols, source=source)
         logger.info(f"User Summary updated with {len(df)} rows")
     # ---------- Excel Export ----------
     # Raw per-hour, per-cell detail (millions of rows across 2G/3G/4G).
@@ -591,7 +740,7 @@ class CSVHistoryManager:
     # report. Loading them into an openpyxl workbook here balloons process
     # memory into the tens of GB (per-cell object overhead), so they're kept
     # out of the combined Excel export.
-    EXCEL_EXPORT_EXCLUDE_SUFFIXES = ('_Cell_Hourly', '_Interference_Hourly')
+    EXCEL_EXPORT_EXCLUDE_SUFFIXES = ('_Cell_Hourly', '_Interference_Hourly', '_Site_Hourly')
 
     def export_to_excel(self, excel_name="Historical_Network_Data.xlsx"):
         """

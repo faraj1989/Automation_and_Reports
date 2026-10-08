@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -33,6 +33,17 @@ DOWNLOAD_DIR = env_path_str("SMARTCARE_DOWNLOAD_DIR", str(Path.home() / "Downloa
 OUTPUT_DIR = env_path_str("SMARTCARE_OUTPUT_DIR", str(Path.home() / "Downloads" / "SmartCare_Exports"))
 EXPORT_TASK_TIMEOUT = env_int("SMARTCARE_EXPORT_TASK_TIMEOUT", 300)
 POLL_INTERVAL = env_int("SMARTCARE_POLL_INTERVAL", 15)
+# The CEM and Device Penetration scrapers share one SmartCare account, so the
+# Async Export list holds BOTH scrapers' tasks. Only a task with this name
+# prefix, submitted after this run's own export request, is ours - picking
+# "the newest task" regardless (the old behaviour) let one scraper download
+# the other's export when both ran at once (2026-09-27).
+TASK_NAME_PREFIX = "Comprehensive_Analysis_"
+# Seconds to keep the browser open after a failure for manual inspection.
+# 0 by default: scheduled runs have nobody watching.
+HOLD_BROWSER_SECONDS = env_int("SMARTCARE_HOLD_BROWSER_SECONDS", 0)
+_REQUEST_SKEW = 120  # portal vs. PC clock tolerance when matching our task
+EXPORT_ATTEMPTS = 2  # re-request once if the portal fails the export task
 
 
 def init_driver():
@@ -40,7 +51,7 @@ def init_driver():
     chrome_options = Options()
     chrome_options.add_argument("--ignore-certificate-errors")
     chrome_options.add_argument("--allow-insecure-localhost")
-    chrome_options.add_argument("--headless=new")
+    #chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--window-size=1920,1080")
 
     prefs = {
@@ -184,7 +195,10 @@ def find_and_click_query_button(driver):
     """Find and click the Query button with improved iframe handling."""
     print("Looking for Query button...")
 
-    # First, try to find if there's an iframe containing the toolbar
+    # Always start from the top-level document: after a successful click the
+    # driver is left INSIDE iframe 1, and searching for iframes from there
+    # finds none - which made every other refresh fail.
+    driver.switch_to.default_content()
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     print(f"Found {len(iframes)} iframe(s) on the page")
 
@@ -341,7 +355,7 @@ def wait_for_task_completion(driver, task_name, timeout=300):
                                 if "Completed" in status:
                                     print(f"Task '{task_name}' is complete!")
                                     return True
-                                elif "Failed" in status or "Error" in status:
+                                elif "fail" in status.lower() or "error" in status.lower():
                                     print(f"Task '{task_name}' failed with status: {status}")
                                     return False
                                 else:
@@ -427,9 +441,16 @@ def extract_task_rows_from_sweet_grid(driver):
     return task_rows
 
 
-def find_latest_task(driver):
-    """Find the latest task from the list."""
+def find_latest_task(driver, name_prefix=TASK_NAME_PREFIX, not_before=None):
+    """Find the newest task that belongs to this scraper: its name starts
+    with name_prefix and (when not_before is given) it was submitted no
+    earlier than not_before. Returns None rather than falling back to some
+    other scraper's task."""
     task_rows = extract_task_rows_from_sweet_grid(driver)
+    if name_prefix:
+        task_rows = [t for t in task_rows if (t.get('task_name') or '').startswith(name_prefix)]
+    if not_before is not None:
+        task_rows = [t for t in task_rows if t.get('created_at') and t['created_at'] >= not_before]
 
     if not task_rows:
         return None
@@ -534,7 +555,7 @@ def click_task_to_download(driver, latest_task):
         return False
 
 
-def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
+def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT, not_before=None):
     """Find and download the latest export task from the Async Export page."""
     print(f"\n--- STEP 9: Async Export Task Manager ---")
 
@@ -583,11 +604,17 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
 
     print(f"Found {len(task_rows)} task row(s) on Async Export page.")
 
-    # Find the latest task
-    latest_task = find_latest_task(driver)
+    # Find our own latest task (right prefix, submitted after our request)
+    latest_task = find_latest_task(driver, not_before=not_before)
+    if latest_task is None:
+        print("[INFO] Our export task isn't listed yet - refreshing once...")
+        find_and_click_query_button(driver)
+        time.sleep(5)
+        latest_task = find_latest_task(driver, not_before=not_before)
 
     if latest_task is None:
-        print("[ERROR] Could not identify the latest task")
+        print(f"[ERROR] No '{TASK_NAME_PREFIX}*' task submitted after {not_before} found - "
+              "not downloading another scraper's export")
         return False
 
     print(
@@ -608,7 +635,7 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
         completed = wait_for_task_completion(driver, task_name, timeout=300)
 
         if not completed:
-            print(f"[ERROR] Task '{task_name}' did not complete within timeout")
+            print(f"[ERROR] Task '{task_name}' failed on the portal or did not complete within timeout")
             return False
 
         # Refresh the task list after completion
@@ -619,8 +646,8 @@ def find_and_download_task(driver, wait, timeout=EXPORT_TASK_TIMEOUT):
         # Re-find the specific task by name (fresh element references)
         latest_task = find_task_by_name(driver, task_name)
         if latest_task is None:
-            # Fallback: try to grab the latest task by timestamp
-            latest_task = find_latest_task(driver)
+            # Fallback: newest task of OURS by timestamp
+            latest_task = find_latest_task(driver, not_before=not_before)
             if latest_task is None:
                 print("[ERROR] Could not find task after refresh")
                 return False
@@ -654,10 +681,12 @@ def parse_args():
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     parser.add_argument("--login-attempts", type=int, default=1,
                         help="Accepted for wrapper compatibility; portal retries are handled by Selenium.")
+    parser.add_argument("--skip-analysis", action="store_true",
+                        help="Only download; run_daily_smartcare_reports.bat runs the analysis as its own step.")
     return parser.parse_args()
 
 
-def smartcare_automation(download_dir=None, output_dir=None):
+def smartcare_automation(download_dir=None, output_dir=None, run_analysis_after=True):
     """Main automation function."""
     global DOWNLOAD_DIR, OUTPUT_DIR
     DOWNLOAD_DIR = str(Path(download_dir or DOWNLOAD_DIR).expanduser().resolve())
@@ -699,7 +728,14 @@ def smartcare_automation(download_dir=None, output_dir=None):
         report_details_tab = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'showTab')][@title='Report Details']"))
         )
-        report_details_tab.click()
+        # The dashboard's loading mask can still cover the tab here, which made a
+        # plain .click() fail with "element click intercepted" (2026-09-28).
+        try:
+            WebDriverWait(driver, 90).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, "div.el-loading-mask")))
+        except Exception:
+            print("Loading mask still visible after 90s - clicking via JavaScript anyway.")
+        driver.execute_script("arguments[0].click();", report_details_tab)
         time.sleep(5)
 
         print("Locating and clicking 'Query' button...")
@@ -728,31 +764,53 @@ def smartcare_automation(download_dir=None, output_dir=None):
         print("Data rows confirmed. Stabilising...")
         time.sleep(10)
 
-        print("Locating 'Export' icon button...")
-        export_icon = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//i[@title='Export' or contains(@class, 'icon-export')]"))
-        )
-        driver.execute_script("arguments[0].click();", export_icon)
-        time.sleep(3)
+        # The portal sometimes fails an export task outright (status "Fail",
+        # seen 2026-10-01 for both CEM and Device Penetration), so a failed task
+        # is re-requested from the dashboard up to EXPORT_ATTEMPTS times.
+        main_window = driver.current_window_handle
+        downloaded_path = None
+        for attempt in range(1, EXPORT_ATTEMPTS + 1):
+            if attempt > 1:
+                print()
+                print(f"--- Export attempt {attempt}/{EXPORT_ATTEMPTS}: re-requesting the export ---")
+                try:
+                    driver.close()  # the Async Export window from the failed attempt
+                except Exception:
+                    pass
+                driver.switch_to.window(main_window)
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                if iframes:
+                    driver.switch_to.frame(iframes[1 if len(iframes) >= 2 else 0])
+                    time.sleep(3)
+                wait = WebDriverWait(driver, 45)
 
-        print("Selecting 'Excel(All Data)' from dropdown...")
-        excel_all_option = wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//li[contains(@class,'el-dropdown-menu__item')][contains(text(),'Excel(All Data)')]")
+            print("Locating 'Export' icon button...")
+            export_icon = wait.until(
+                EC.presence_of_element_located((By.XPATH, "//i[@title='Export' or contains(@class, 'icon-export')]"))
             )
-        )
-        driver.execute_script("arguments[0].click();", excel_all_option)
-        print("Export task successfully requested!")
-        time.sleep(10)
+            driver.execute_script("arguments[0].click();", export_icon)
+            time.sleep(3)
 
-        print("Opening a separate Chrome window for Async Export Task Manager...")
-        driver = open_task_manager_window(driver)
+            print("Selecting 'Excel(All Data)' from dropdown...")
+            excel_all_option = wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//li[contains(@class,'el-dropdown-menu__item')][contains(text(),'Excel(All Data)')]")
+                )
+            )
+            request_time = datetime.now()
+            driver.execute_script("arguments[0].click();", excel_all_option)
+            print(f"Export task successfully requested at {request_time:%Y-%m-%d %H:%M:%S}!")
+            time.sleep(10)
 
-        # Create a new wait object for the new window
-        wait = WebDriverWait(driver, 45)
+            print("Opening a separate Chrome window for Async Export Task Manager...")
+            driver = open_task_manager_window(driver)
+            wait = WebDriverWait(driver, 45)
 
-        # Find and download the task
-        downloaded_path = find_and_download_task(driver, wait)
+            # Find and download OUR task (prefix + submitted after our request)
+            downloaded_path = find_and_download_task(
+                driver, wait, not_before=request_time - timedelta(seconds=_REQUEST_SKEW))
+            if downloaded_path:
+                break
 
         if downloaded_path:
             source = Path(downloaded_path)
@@ -765,24 +823,29 @@ def smartcare_automation(download_dir=None, output_dir=None):
                 shutil.move(str(source), str(destination))
             print(f"\nAutomation complete. File moved to: {destination}")
 
-            try:
-                from reports.run_smartcare_analysis_task import run_analysis
-                print("\nRunning SmartCare analysis on the fresh export...")
-                run_analysis()
-                print("Analysis complete - historical archive updated.")
-            except Exception as exc:
-                print(f"[WARN] Auto-analysis after download failed (scrape itself succeeded): {exc}")
+            if not run_analysis_after:
+                print("Skipping analysis here (run as a separate step).")
+            else:
+                try:
+                    from reports.run_smartcare_analysis_task import run_analysis
+                    print("\nRunning SmartCare analysis on the fresh export...")
+                    run_analysis()
+                    print("Analysis complete - historical archive updated.")
+                except Exception as exc:
+                    print(f"[WARN] Auto-analysis after download failed (scrape itself succeeded): {exc}")
         else:
             print("\n[WARN] Automation finished but the file may not have downloaded. Check the browser window.")
-            print("[INFO] Holding browser open for 5 minutes for manual inspection...")
-            time.sleep(300)
+            if HOLD_BROWSER_SECONDS:
+                print(f"[INFO] Holding browser open {HOLD_BROWSER_SECONDS}s for manual inspection...")
+                time.sleep(HOLD_BROWSER_SECONDS)
 
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Automation sequence broken: {e}")
         import traceback
         traceback.print_exc()
-        print("[INFO] Holding browser open for 5 minutes for manual inspection...")
-        time.sleep(300)
+        if HOLD_BROWSER_SECONDS:
+            print(f"[INFO] Holding browser open {HOLD_BROWSER_SECONDS}s for manual inspection...")
+            time.sleep(HOLD_BROWSER_SECONDS)
 
     finally:
         print("Closing browser session.")
@@ -791,4 +854,4 @@ def smartcare_automation(download_dir=None, output_dir=None):
 
 if __name__ == "__main__":
     args = parse_args()
-    smartcare_automation(args.download_dir, args.output_dir)
+    smartcare_automation(args.download_dir, args.output_dir, run_analysis_after=not args.skip_analysis)

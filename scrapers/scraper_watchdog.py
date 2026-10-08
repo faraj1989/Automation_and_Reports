@@ -21,17 +21,29 @@ with a password already known to be wrong)."""
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from project_config import PROJECT_ROOT, env_str, is_login_failed_today
+from project_config import PROJECT_ROOT, env_str, is_login_failed_today, is_paused, load_env_file
+import periodic_jobs
 
 PYTHON_EXE = sys.executable
 LOG_DIR = PROJECT_ROOT / "logs" / "scrapers"
 CHECK_INTERVAL_SECONDS = 60
+
+# Weekly/monthly scheduler.py jobs backstop (see periodic_jobs.py): Task
+# Scheduler gets the first go at each due time, then the watchdog runs any
+# job still without a success stamp - one job at a time, never alongside
+# another scheduler.py run (e.g. the 06:30 daily pipeline), retrying a
+# failed job at most every PERIODIC_RETRY.
+PERIODIC_GRACE = timedelta(minutes=45)
+PERIODIC_RETRY = timedelta(hours=2)
+PERIODIC_STARTUP_DELAY = timedelta(minutes=10)
+SCHEDULER_SCRIPT = PROJECT_ROOT / "scheduler.py"
+PERIODIC_LOG_DIR = PROJECT_ROOT / "logs" / "job_state"
 
 # name: shown in logs and as the mark_login_failed() key each scraper uses.
 # file: relative path the scraper script itself is launched with.
@@ -139,6 +151,48 @@ def start(entry):
     log(f"Started {entry['name']} (log: {log_file.name})")
 
 
+def check_periodic_jobs(started_at, last_attempt, now=None):
+    """Launch at most one overdue weekly/monthly job; returns its name or None."""
+    now = now or datetime.now()
+    if now - started_at < PERIODIC_STARTUP_DELAY:
+        return None
+    if is_process_running("scheduler.py"):
+        return None
+    for job, spec in periodic_jobs.PERIODIC_JOBS.items():
+        if not periodic_jobs.is_overdue(job, now):
+            continue
+        if now < periodic_jobs.last_due(job, now) + PERIODIC_GRACE:
+            continue
+        if job in last_attempt and now - last_attempt[job] < PERIODIC_RETRY:
+            continue
+        last_attempt[job] = now
+        start_periodic_job(job, spec["flag"])
+        return job
+    return None
+
+
+def start_periodic_job(job, flag):
+    PERIODIC_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    child_env = os.environ.copy()
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    # scheduler.py writes its own detailed scheduler.log; this file only
+    # catches anything printed before its logging is set up (e.g. an import crash).
+    with open(PERIODIC_LOG_DIR / f"{job}_watchdog_run.log", "w", encoding="utf-8", errors="replace") as f:
+        subprocess.Popen(
+            [PYTHON_EXE, str(SCHEDULER_SCRIPT), flag],
+            cwd=str(PROJECT_ROOT),
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            start_new_session=True,
+        )
+    log(f"Periodic job {job} missed its last scheduled run ({periodic_jobs.last_due(job):%Y-%m-%d %H:%M}) "
+        f"- started scheduler.py {flag}")
+
+
 def main():
     if not is_only_instance():
         log("Another watchdog process is already running - exiting so there's only one.")
@@ -146,10 +200,23 @@ def main():
 
     log("Watchdog starting. Managing: " + ", ".join(e["name"] for e in CONTINUOUS_SCRIPTS))
     log(f"Check interval: {CHECK_INTERVAL_SECONDS}s")
+    log("Also backstopping periodic jobs: " + ", ".join(periodic_jobs.PERIODIC_JOBS))
     import time
+    started_at = datetime.now()
+    periodic_last_attempt = {}
     while True:
+        try:
+            check_periodic_jobs(started_at, periodic_last_attempt)
+        except Exception as e:
+            log(f"Periodic job check failed: {e}")
+        # Re-read .env every check (load_env_file never overrides by default, so
+        # this process would otherwise keep - and hand to every scraper it
+        # relaunches - the values it saw at startup, e.g. an expired password).
+        load_env_file(override=True)
         for entry in CONTINUOUS_SCRIPTS:
             if is_process_running(entry["file"]):
+                continue
+            if is_paused(entry["name"]):
                 continue
             current_password = env_str(entry["password_env"])
             if is_login_failed_today(entry["name"], current_password):

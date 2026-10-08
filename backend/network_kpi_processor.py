@@ -117,6 +117,7 @@ def process_network_kpis(day_folder, log_callback=None):
                             df = df.drop_duplicates(
                                 subset=['Date', 'Whole Network']) if 'Whole Network' in df.columns else df
 
+                    df.attrs['source_file'] = os.path.basename(file_path)  # lineage for the history audit log
                     results[sheet_name] = df
                     log(f"   ✅ Loaded {len(df)} rows, {len(df.columns)} columns")
                     if 'Date' in df.columns:

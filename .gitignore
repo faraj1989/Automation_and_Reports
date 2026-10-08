@@ -20,3 +20,32 @@ ftp_config.json
 ftp_config.jason
 .env
 logs/login_failures/
+logs/job_state/
+
+# Control panel - password hash and settings backups (backups hold secrets)
+control_panel/auth.json
+control_panel/backups/
+logs/paused/
+# Additional environment and credential protection
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python testing and caching
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local temporary files
+*.tmp
+*.bak

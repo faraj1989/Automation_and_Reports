@@ -41,6 +41,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from openpyxl.chart import LineChart, Reference
 
 import matplotlib
 matplotlib.use('Agg')  # headless - this runs server-side, no display available
@@ -50,6 +51,7 @@ from backend.health_checker import HealthChecker
 from backend import noc_alarm_processor as noc_alarms
 from backend import smartcare_cem_processor as cem
 from backend import device_penetration_processor as device_penetration
+from backend import packet_loss_engine as pl_engine
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,29 @@ CELL_SHEETS = {'GSM': '2G_Cell_CSBH', 'UMTS': '3G_Cell_CSBH', 'LTE': '4G_Cell_BH
 SITE_COL_BY_TECH = {'GSM': 'Site Name', 'UMTS': 'NodeB Name', 'LTE': 'eNodeB Name'}
 
 TOPOLOGY_FILE = "config/site_topology.csv"
+
+# Per-site PS+CS traffic pipeline CSVs (same output/csv/Traffic_2G/3G/4G.csv
+# the older "PS Traffic per site" tab reads, but that tab only picks out the
+# PS column - these also carry the CS Traffic (Erl) columns per site, used
+# by the Traffic per Site tab below. 4G has no true CS traffic; VoLTE is its
+# voice-equivalent, kept separate from Total CS Traffic (which is 2G+3G
+# only) to match the existing 'Total CS Traffic (Erl)' convention used
+# elsewhere in this report (see build_site_summary_report/dashboard cards).
+TRAFFIC_SITE_FILES = {
+    'GSM': {'sheet': 'Traffic_2G', 'ps_col': '2G PS Traffic (GB)', 'cs_col': '2G CS Traffic (Erl)'},
+    'UMTS': {'sheet': 'Traffic_3G', 'ps_col': '3G PS Traffic (GB)', 'cs_col': '3G CS Traffic (Erl)'},
+    'LTE': {'sheet': 'Traffic_4G', 'ps_col': '4G DL Traffic (GB)', 'volte_col': '4G VoLTE Traffic (Erl)'},
+}
+
+_SITE_SUFFIX_RE = re.compile(r'\s*\(.*?\)\s*$')
+
+
+def base_site_name(name) -> str:
+    """Site name with any trailing '(...)' tag stripped, upper-cased - the
+    traffic exports tag sites as e.g. 'KUFR002(FTTS)' / 'XXX(FN)' while the
+    FN-HUB topology uses the bare 'KUFR002' (and sometimes its own tags like
+    'BGZ033 (SELMANI)'), so both sides are matched on this key."""
+    return _SITE_SUFFIX_RE.sub('', str(name)).strip().upper()
 
 # Multi-RAT site composition, straight from SiteSummary.csv (section 8)
 SITE_OVERLAP_COLS = [
@@ -542,6 +567,53 @@ class ReportGenerator:
                 })
         return pd.DataFrame(rows)
 
+    def _load_topology(self) -> pd.DataFrame:
+        if not os.path.exists(TOPOLOGY_FILE):
+            return pd.DataFrame()
+        try:
+            df = pd.read_csv(TOPOLOGY_FILE)
+        except Exception as e:
+            logger.warning(f"Could not read {TOPOLOGY_FILE}: {e}")
+            return pd.DataFrame()
+        return df
+
+    def get_regions(self) -> List[str]:
+        """Sorted region list from the FN/HUB topology reference, for the
+        Traffic per Site tab's region filter."""
+        df = self._load_topology()
+        if df.empty:
+            return []
+        return sorted(df['Region'].dropna().unique().tolist())
+
+    def get_fn_hub_nodes(self) -> List[str]:
+        df = self._load_topology()
+        if df.empty:
+            return []
+        return sorted(df['Node_Name'].dropna().unique().tolist())
+
+    def get_sites_for_region(self, region: str) -> List[str]:
+        df = self._load_topology()
+        if df.empty:
+            return []
+        return sorted(df[df['Region'] == region]['Connected_Site'].dropna().unique().tolist())
+
+    def get_sites_for_fn_hub(self, node_name: str) -> List[str]:
+        df = self._load_topology()
+        if df.empty:
+            return []
+        return sorted(df[df['Node_Name'] == node_name]['Connected_Site'].dropna().unique().tolist())
+
+    def _site_region_map(self) -> Dict[str, str]:
+        df = self._load_topology()
+        if df.empty:
+            return {}
+        # A site can appear under more than one node/region (rare - e.g. a
+        # HUB site itself relayed by another FN); first match wins, same as
+        # a site just needing *a* region label here, not the full topology.
+        df = df.dropna(subset=['Connected_Site'])
+        keys = df['Connected_Site'].map(base_site_name)
+        return df.assign(_key=keys).drop_duplicates('_key').set_index('_key')['Region'].to_dict()
+
     def build_alarm_overview(self) -> Dict:
         """Network-wide NOC alarm view for the Alarms section: live
         currently-down sites plus historical chronic-offender/downtime/
@@ -570,6 +642,13 @@ class ReportGenerator:
         historical alarm exports, independent of its own (currently
         overloaded) ledger pipeline. See backend/noc_alarm_processor.py."""
         return noc_alarms.build_daily_noc_alarm_report(target_date)
+
+    def build_daily_noc_alarm_range(self, start_date: str, end_date: str) -> Dict:
+        """build_daily_noc_alarm_report for every day in start..end, stacked
+        (per-site rows, per-event rows, per-day data quality) - for the
+        dashboard's date-range view and Excel export. See
+        backend/noc_alarm_processor.py."""
+        return noc_alarms.build_daily_noc_alarm_range(start_date, end_date)
 
     def build_cem_overview(self) -> Dict:
         """Subscriber-experience view (SmartCare CEM: application traffic
@@ -613,6 +692,19 @@ class ReportGenerator:
             for c in present
         }
 
+        # Freshness: file mtime = last time the daily pipeline checked the
+        # sites; 'Last Updated' per site = last REAL config change.
+        path = os.path.join(self.csv_folder, 'SiteDetail.csv')
+        file_refreshed = datetime.fromtimestamp(os.path.getmtime(path)) if os.path.exists(path) else None
+        changed = (pd.to_datetime(site_detail['Last Updated'], format='mixed', errors='coerce')
+                   if 'Last Updated' in site_detail.columns else pd.Series(dtype='datetime64[ns]'))
+        latest_change = changed.max() if changed.notna().any() else None
+        recent_changes = pd.DataFrame()
+        if latest_change is not None:
+            recent = site_detail.assign(**{'Last Updated': changed.dt.strftime('%Y-%m-%d')})
+            recent_changes = (recent[changed >= latest_change - pd.Timedelta(days=30)]
+                              .sort_values('Last Updated', ascending=False))
+
         return {
             'loaded': True,
             'total_sites': len(site_detail),
@@ -622,54 +714,203 @@ class ReportGenerator:
             'multi_carrier_lte_sites': multi_carrier_sites,
             'no_lte_sites': no_lte_sites,
             'band_adoption': band_adoption,
+            'file_refreshed': file_refreshed,
+            'latest_change': latest_change,
+            'recent_changes': recent_changes,
         }
 
-    # No config/kpi_thresholds.csv entry exists for backhaul ping packet
-    # loss specifically (only LTE user-plane packet loss, a different
-    # metric, at 0.5%) - this is a transport/backhaul-link quality bar,
-    # not a source-of-truth threshold, kept as a named constant so it's
-    # easy to tune rather than buried in the aggregation logic below.
-    PACKET_LOSS_ELEVATED_PCT = 0.1
+    # ---------------------------------------------------------------
+    # Packet loss (IUB/ABIS backhaul) - logic lives in
+    # backend/packet_loss_engine.py, thresholds in
+    # config/packet_loss_rules.csv. These methods only load the archives
+    # built by transmission_kpi_processor.py and slice them by window/sites.
+    # ---------------------------------------------------------------
 
-    def build_packet_loss_report(self, period: str, target_date: str) -> pd.DataFrame:
-        """Transmission_KPIs.csv (IUB/ABIS ping packet loss/delay, one row
-        per adjacency per day) rolled up over `period` ('day'/'week'/
-        'month' - week = trailing 7 days, month = trailing 30 days, both
-        ending at target_date) and ranked by Avg Packet Loss(%) descending,
-        per your ask. One row per (Site Name, Adjacent Node Name)."""
-        df = self._load_csv('Transmission_KPIs')
+    def _packet_loss_site_daily(self, start=None, end=None, sites=None) -> Optional[pd.DataFrame]:
+        df = self._load_csv('Packet_Loss_Site_Daily')
         if df is None or df.empty:
+            return None
+        if start is not None:
+            df = df[df['Date'] >= pd.Timestamp(start).strftime('%Y-%m-%d')]
+        if end is not None:
+            df = df[df['Date'] <= pd.Timestamp(end).strftime('%Y-%m-%d')]
+        if sites:
+            df = df[df['Site'].isin({s.upper() for s in sites})]
+        return df
+
+    def packet_loss_dates(self) -> List[str]:
+        df = self._load_csv('Packet_Loss_Site_Daily')
+        return sorted(df['Date'].dropna().unique().tolist()) if df is not None else []
+
+    def packet_loss_sites(self) -> pd.DataFrame:
+        """Site list with Region/GBSC/FN-HUB chain (latest known) for pickers."""
+        df = self._load_csv('Packet_Loss_Site_Daily')
+        if df is None or df.empty:
+            return pd.DataFrame(columns=['Site', 'Region', 'GBSC', 'FN/HUB Chain'])
+        return (df.sort_values('Date').drop_duplicates('Site', keep='last')
+                  [['Site', 'Region', 'GBSC', 'FN/HUB Chain']].sort_values('Site').reset_index(drop=True))
+
+    def build_packet_loss_sites(self, start, end, sites=None) -> pd.DataFrame:
+        """Per-site classification over [start, end] (see
+        packet_loss_engine.classify_sites): Class, Suspected Cause, Pattern,
+        Affected RAT, loss/no-response/hub-event hours..."""
+        d = self._packet_loss_site_daily(start, end, sites)
+        if d is None or d.empty:
             return pd.DataFrame()
+        return pl_engine.classify_sites(d, start, end, pl_engine.load_rules())
 
-        df = df.copy()
-        df['_date'] = pd.to_datetime(df['Date'], errors='coerce')
-        end = pd.to_datetime(self.health_checker.normalize_date(target_date))
-        if pd.isna(end):
+    def build_packet_loss_hubs(self, start, end, sites=None) -> pd.DataFrame:
+        return pl_engine.summarize_hub_events(self._load_csv('Packet_Loss_Hub_Events'), start, end, sites)
+
+    def build_packet_loss_trend(self, start, end) -> pd.DataFrame:
+        """Network trend per day: how many sites had any loss hour, 3+ loss
+        hours, a chronic day (>= chronic_share of hours), no-response hours,
+        and how many hub events ran."""
+        d = self._packet_loss_site_daily(start, end)
+        if d is None or d.empty:
             return pd.DataFrame()
-        span_days = {'day': 1, 'week': 7, 'month': 30}.get(period, 1)
-        start = end - pd.Timedelta(days=span_days - 1)
-        window = df[(df['_date'] >= start) & (df['_date'] <= end)]
-        if window.empty:
+        rules = pl_engine.load_rules()
+        chronic = d['Loss Hours'] >= rules['chronic_share'] * d['Hours Measured'].clip(lower=1)
+        out = d.assign(
+            _any=d['Loss Hours'] > 0,
+            _three=d['Loss Hours'] >= 3,
+            _chronic=chronic & (d['Loss Hours'] > 0),
+            _nr=d['No Response Hours'] > 0,
+        ).groupby('Date').agg(**{
+            'Sites with loss hours': ('_any', 'sum'),
+            'Sites with 3+ loss hours': ('_three', 'sum'),
+            'Sites lossy most of the day': ('_chronic', 'sum'),
+            'Sites with no-response hours': ('_nr', 'sum'),
+            'Total loss hours': ('Loss Hours', 'sum'),
+        }).reset_index()
+        hubs = self._load_csv('Packet_Loss_Hub_Events')
+        if hubs is not None and not hubs.empty:
+            out['Hub events'] = out['Date'].map(hubs.groupby('Date').size()).fillna(0).astype(int)
+        return out
+
+    def build_packet_loss_matrix(self, start, end, sites, value='Loss Hours') -> pd.DataFrame:
+        """Site x Date matrix of a daily metric (default loss hours) - the
+        'which days was it bad' view for a special report."""
+        d = self._packet_loss_site_daily(start, end, sites)
+        if d is None or d.empty or value not in d.columns:
             return pd.DataFrame()
+        m = d.pivot_table(index='Site', columns='Date', values=value, aggfunc='sum')
+        m = m.reindex(columns=sorted(m.columns))
+        m.insert(0, 'Total', m.sum(axis=1))
+        return m.sort_values('Total', ascending=False).reset_index()
 
-        group_cols = [c for c in ['Site Name', 'Adjacent Node Name', 'Adjacent Node Type', 'GBSC'] if c in window.columns]
-        if not group_cols:
+    def get_packet_loss_hourly(self, sites, start=None, end=None) -> pd.DataFrame:
+        """Hourly site detail (rolling retention, see hourly_retention_days)."""
+        df = self._load_csv('Packet_Loss_Site_Hourly')
+        if df is None or df.empty or not sites:
             return pd.DataFrame()
+        df = df[df['Site'].isin({s.upper() for s in sites})]
+        if start is not None:
+            df = df[df['Time'].str[:10] >= pd.Timestamp(start).strftime('%Y-%m-%d')]
+        if end is not None:
+            df = df[df['Time'].str[:10] <= pd.Timestamp(end).strftime('%Y-%m-%d')]
+        return df.reset_index(drop=True)
 
-        agg = window.groupby(group_cols, dropna=False).agg(
-            **{
-                'Avg Packet Loss(%)': ('Avg Packet Loss(%)', 'mean'),
-                'Max Packet Loss(%)': ('Max Packet Loss(%)', 'max'),
-                'Avg Delay(ms)': ('Avg Delay(ms)', 'mean'),
-                'Max Delay(ms)': ('Max Delay(ms)', 'max'),
-                'Days Reporting': ('_date', 'nunique'),
-            }
-        ).reset_index()
+    def build_packet_loss_core_links(self, start, end) -> pd.DataFrame:
+        """Core-network interfaces (IUR/A/IUCS/IUPS) - not site backhaul, so
+        they're kept out of the site ranking and shown on their own."""
+        df = self._load_csv('Transmission_KPIs')
+        if df is None or df.empty or 'RAT' not in df.columns:
+            return pd.DataFrame()
+        s, e = pd.Timestamp(start).strftime('%Y-%m-%d'), pd.Timestamp(end).strftime('%Y-%m-%d')
+        df = df[(df['RAT'] == 'Core') & (df['Date'] >= s) & (df['Date'] <= e)]
+        if df.empty:
+            return pd.DataFrame()
+        out = df.groupby(['GBSC', 'Adjacent Node Name', 'Adjacent Node Type'], as_index=False).agg(**{
+            'Loss Hours': ('Loss Hours', 'sum'),
+            'No Response Hours': ('No Response Hours', 'sum'),
+            'Avg Packet Loss(%)': ('Avg Packet Loss(%)', 'mean'),
+            'Max Packet Loss(%)': ('Max Packet Loss(%)', 'max'),
+            'Avg Delay(ms)': ('Avg Delay(ms)', 'mean'),
+            'Max Delay(ms)': ('Max Delay(ms)', 'max'),
+        })
+        for c in ['Avg Packet Loss(%)', 'Avg Delay(ms)']:
+            out[c] = out[c].round(3)
+        return out.sort_values(['Loss Hours', 'Avg Packet Loss(%)'], ascending=False).reset_index(drop=True)
 
-        for col in ['Avg Packet Loss(%)', 'Max Packet Loss(%)', 'Avg Delay(ms)', 'Max Delay(ms)']:
-            agg[col] = agg[col].round(4)
+    def build_packet_loss_excel(self, start, end, sites=None, label: str = '') -> bytes:
+        """Packet loss workbook for a window (whole network, or a special
+        report's selected sites): Info + rules, class summary, site
+        classification, hub events, site x day loss-hour heatmap, daily
+        detail and (selected sites only) hourly detail."""
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.formatting.rule import ColorScaleRule
 
-        return agg.sort_values('Avg Packet Loss(%)', ascending=False, na_position='last').reset_index(drop=True)
+        rules = pl_engine.load_rules()
+        s, e = pd.Timestamp(start).strftime('%Y-%m-%d'), pd.Timestamp(end).strftime('%Y-%m-%d')
+        cls = self.build_packet_loss_sites(s, e, sites)
+        hubs = self.build_packet_loss_hubs(s, e, sites)
+        scope_sites = sites or (cls.loc[cls['Class'].isin(pl_engine.FLAGGED_CLASSES + ['🟡 Sporadic']), 'Site']
+                                .tolist() if not cls.empty else [])
+        matrix = self.build_packet_loss_matrix(s, e, scope_sites) if scope_sites else pd.DataFrame()
+        daily = self._packet_loss_site_daily(s, e, sites) if sites else None
+        hourly = self.get_packet_loss_hourly(sites, s, e) if sites else pd.DataFrame()
+        summary = (cls['Class'].value_counts().reindex(pl_engine.CLASS_ORDER, fill_value=0)
+                   .rename_axis('Class').reset_index(name='Sites')) if not cls.empty else pd.DataFrame()
+
+        info = [['Report', 'Packet Loss (IUB/ABIS backhaul)'],
+                ['Label', label or ('Selected sites' if sites else 'Whole network')],
+                ['Period', f"{s} to {e} ({(pd.Timestamp(e) - pd.Timestamp(s)).days + 1} day(s))"],
+                ['Sites', ', '.join(sites) if sites else f"All ({len(cls)})"],
+                ['Generated', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                ['', ''],
+                ['How to read', 'Sites are ranked by HOW MANY HOURS they lost packets, not by the average: '
+                                'an average hides intermittent problems.'],
+                ['Loss hour', f"hourly avg ping loss >= {rules['loss_hour_pct']}%"],
+                ['No response hour', 'NIL loss (no ping replies) - link/site down, never counted as 0%'],
+                ['Chronic', f"loss hours >= {int(rules['chronic_share'] * 100)}% of measured hours"],
+                ['Recurrent', f"loss on >= {int(rules['recurrent_min_days'])} different days "
+                              f"(and >= {int(rules['recurrent_day_share'] * 100)}% of the window's days)"],
+                ['Hub event', f">= {int(rules['hub_min_sites'])} sites and >= {int(rules['hub_min_share'] * 100)}% "
+                              f"of one FN/HUB node affected in the same hour"],
+                ['Traffic-driven', 'busy-hour loss >> night loss -> congestion / capacity'],
+                ['Constant', 'loss all day -> link quality fault (MW, fiber, equipment)'],
+                ['Thresholds file', 'config/packet_loss_rules.csv']]
+
+        sheets = [('Info', pd.DataFrame(info, columns=['Field', 'Value'])),
+                  ('Summary', summary), ('Sites', cls), ('Hub Events', hubs),
+                  ('Loss Hours by Day', matrix)]
+        if daily is not None and not daily.empty:
+            sheets.append(('Daily Detail', daily))
+        if not hourly.empty:
+            sheets.append(('Hourly Detail', hourly))
+
+        fills = {'🔴': 'F8CBAD', '🟠': 'FCE4D6', '🟡': 'FFF2CC', '⚫': 'D9D9D9', '⚪': 'EDEDED', '🟢': 'E2EFDA'}
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            for name, df in sheets:
+                if df is None or df.empty:
+                    df = pd.DataFrame([{'Status': 'No data for this selection'}])
+                df.to_excel(writer, sheet_name=name, index=False)
+                ws = writer.sheets[name]
+                ws.freeze_panes = 'B2' if name in ('Sites', 'Loss Hours by Day') else 'A2'
+                for cell in ws[1]:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill('solid', fgColor='1F4E78')
+                    cell.alignment = Alignment(wrap_text=True, vertical='center')
+                if name in ('Sites', 'Summary') and 'Class' in df.columns:
+                    col = df.columns.get_loc('Class') + 1
+                    for r in range(2, len(df) + 2):
+                        c = ws.cell(row=r, column=col)
+                        color = fills.get(str(c.value)[:1])
+                        if color:
+                            for cc in ws[r]:
+                                cc.fill = PatternFill('solid', fgColor=color)
+                if name == 'Loss Hours by Day' and len(df.columns) > 2:
+                    from openpyxl.utils import get_column_letter
+                    rng = f"C2:{get_column_letter(len(df.columns))}{len(df) + 1}"
+                    ws.conditional_formatting.add(rng, ColorScaleRule(
+                        start_type='num', start_value=0, start_color='FFFFFF',
+                        mid_type='num', mid_value=6, mid_color='FFD966',
+                        end_type='num', end_value=24, end_color='C00000'))
+            autofit_excel_columns(writer)
+        buf.seek(0)
+        return buf.read()
 
     def build_site_inventory(self, target_date: str) -> pd.DataFrame:
         """Section 8: multi-RAT site composition (from SiteSummary.csv)."""
@@ -1837,6 +2078,210 @@ class ReportGenerator:
         doc.save(filepath)
         logger.info(f"✅ Special report saved: {filepath}")
         return filepath
+
+    # ------------------------------------------------------------------
+    # Traffic per Site - PS+CS traffic filtered by Region/FN-HUB Node/
+    # hand-picked sites over a custom date range (e.g. "CS+PS traffic for
+    # the KUFRA region, last 14 days"), with a combined trend chart and
+    # Word/Excel export.
+    # ------------------------------------------------------------------
+
+    def get_all_traffic_sites(self) -> List[str]:
+        """Every site name present in the per-site traffic pipeline (union
+        across 2G/3G/4G), for the Traffic per Site tab's 'Specific Sites'
+        picker. Names are base_site_name()-normalised so they line up with
+        the FN-HUB topology's site names."""
+        sites = set()
+        for cfg in TRAFFIC_SITE_FILES.values():
+            df = self._load_csv(cfg['sheet'])
+            if df is not None and 'Site' in df.columns:
+                sites.update(base_site_name(s) for s in df['Site'].dropna().unique())
+        return sorted(sites)
+
+    def build_site_traffic_detail(self, site_names: List[str], start_date: str,
+                                   end_date: str) -> Optional[pd.DataFrame]:
+        """Per-site-per-day PS+CS traffic, merged across 2G/3G/4G, for the
+        given sites and date range - one row per (Date, Site). This is the
+        Traffic per Site tab's underlying detail table;
+        build_site_traffic_aggregate_trend() below sums it into the
+        chart/export trend line."""
+        if not site_names:
+            return None
+
+        wanted = {base_site_name(s) for s in site_names}
+        merged = None
+        subnet_lookup: Dict[str, str] = {}
+        for cfg in TRAFFIC_SITE_FILES.values():
+            df = self._load_csv(cfg['sheet'])
+            if df is None or 'Site' not in df.columns:
+                continue
+            # Match on the suffix-stripped name (traffic 'KUFR002(FTTS)' ==
+            # topology 'KUFR002'); normalising only the ~800 unique names,
+            # not every row.
+            name_map = {s: base_site_name(s) for s in df['Site'].dropna().unique()}
+            raw_hits = [raw for raw, base in name_map.items() if base in wanted]
+            sub = df[df['Site'].isin(raw_hits)].copy()
+            if sub.empty:
+                continue
+            sub['Site'] = sub['Site'].map(name_map)
+            sub['_dt'] = pd.to_datetime(sub['Date'], errors='coerce')
+            sub = sub[(sub['_dt'] >= pd.to_datetime(start_date)) & (sub['_dt'] <= pd.to_datetime(end_date))]
+            if sub.empty:
+                continue
+
+            if 'Subnet Name' in sub.columns:
+                for site, name in sub.drop_duplicates('Site')[['Site', 'Subnet Name']].itertuples(index=False):
+                    subnet_lookup.setdefault(site, name)
+
+            metric_cols = [c for c in (cfg.get('ps_col'), cfg.get('cs_col'), cfg.get('volte_col'))
+                           if c and c in sub.columns]
+            keep = sub[['Date', 'Site'] + metric_cols]
+            merged = keep if merged is None else merged.merge(keep, on=['Date', 'Site'], how='outer')
+
+        if merged is None or merged.empty:
+            return None
+
+        merged['Subnet Name'] = merged['Site'].map(subnet_lookup)
+        merged['Region'] = merged['Site'].map(self._site_region_map())
+
+        ps_cols = [cfg['ps_col'] for cfg in TRAFFIC_SITE_FILES.values() if cfg['ps_col'] in merged.columns]
+        cs_cols = [cfg['cs_col'] for cfg in TRAFFIC_SITE_FILES.values() if 'cs_col' in cfg and cfg['cs_col'] in merged.columns]
+        merged['Total PS Traffic (GB)'] = merged[ps_cols].sum(axis=1, skipna=True) if ps_cols else 0.0
+        # 2G+3G only, matching the 'Total CS Traffic (Erl)' convention used
+        # elsewhere in this report (site summary cards) - 4G VoLTE stays a
+        # separate column, it isn't circuit-switched traffic.
+        merged['Total CS Traffic (Erl)'] = merged[cs_cols].sum(axis=1, skipna=True) if cs_cols else 0.0
+
+        front = ['Date', 'Site', 'Region', 'Subnet Name']
+        rest = [c for c in merged.columns if c not in front]
+        merged = merged[front + rest]
+        return merged.sort_values(['Date', 'Site']).reset_index(drop=True)
+
+    @staticmethod
+    def split_sites_by_traffic_data(site_names: List[str],
+                                    detail: Optional[pd.DataFrame]) -> Tuple[List[str], List[str]]:
+        """(sites with >=1 traffic row in `detail`, sites with none) - both
+        base_site_name()-normalised and sorted, so the report can say
+        '8 with data, KUFRAGP has none' instead of silently summing '9'."""
+        present = set(detail['Site']) if detail is not None and not detail.empty else set()
+        scope = sorted({base_site_name(s) for s in site_names})
+        return [s for s in scope if s in present], [s for s in scope if s not in present]
+
+    def build_site_traffic_aggregate_trend(self, site_names: List[str], start_date: str,
+                                            end_date: str) -> Optional[pd.DataFrame]:
+        """Sums every selected site's traffic into one row per Date - the
+        'whole group' trend line for the Traffic per Site tab's chart and
+        Word/Excel export, so a Region/FN-HUB group with many sites still
+        renders as one readable line per metric instead of one per site."""
+        detail = self.build_site_traffic_detail(site_names, start_date, end_date)
+        if detail is None or detail.empty:
+            return None
+        metric_cols = [c for c in detail.columns if c not in ('Date', 'Site', 'Region', 'Subnet Name')]
+        agg = detail.groupby('Date', as_index=False)[metric_cols].sum(min_count=1)
+        agg['_dt'] = pd.to_datetime(agg['Date'])
+        agg = agg.sort_values('_dt').drop(columns=['_dt']).reset_index(drop=True)
+        return agg
+
+    def generate_traffic_group_word_report(self, scope_label: str, site_names: List[str],
+                                            start_date: str, end_date: str) -> Optional[str]:
+        detail = self.build_site_traffic_detail(site_names, start_date, end_date)
+        if detail is None or detail.empty:
+            return None
+        agg_trend = self.build_site_traffic_aggregate_trend(site_names, start_date, end_date)
+
+        doc = Document()
+        style = doc.styles['Normal']
+        style.font.name = 'Calibri'
+        style.font.size = Pt(10)
+
+        title = doc.add_heading('LIBYANA TRAFFIC PER SITE REPORT', level=0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in title.runs:
+            run.font.color.rgb = RGBColor(0x1F, 0x4E, 0x78)
+        sub = doc.add_paragraph(f"{scope_label}  |  {start_date} to {end_date}")
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sub.runs[0].font.size = Pt(12)
+        sub.runs[0].font.bold = True
+        doc.add_paragraph()
+
+        with_data, no_data = self.split_sites_by_traffic_data(site_names, detail)
+        doc.add_paragraph(f"Sites in scope: {len(with_data) + len(no_data)}  |  "
+                          f"with traffic data: {len(with_data)}")
+        doc.add_paragraph(f"Sites included ({len(with_data)}): " + ', '.join(with_data))
+        if no_data:
+            doc.add_paragraph(f"No traffic data ({len(no_data)}): " + ', '.join(no_data)
+                              + "  (e.g. transmission-only FN/HUB node, or site not in the traffic export)")
+
+        latest_date = detail['Date'].max()
+        self._docx_section_heading(doc, f'Per-Site Detail — {latest_date}')
+        self._docx_add_table(doc, detail[detail['Date'] == latest_date].drop(columns=['Date']))
+
+        self._docx_section_heading(doc, f'Combined Trend ({start_date} to {end_date})')
+        doc.add_paragraph(f"Sum across the {len(with_data)} site(s) with traffic data, one line per metric.")
+        if agg_trend is not None and not agg_trend.empty:
+            trend_cols = [c for c in agg_trend.columns if c != 'Date']
+            self._docx_add_chart_grid(doc, agg_trend, trend_cols, {})
+
+        safe_label = re.sub(r'[^A-Za-z0-9_-]+', '_', scope_label).strip('_')[:40] or 'Traffic'
+        filename = f"Traffic_per_Site_{safe_label}_{start_date}_to_{end_date}.docx"
+        filepath = os.path.join(self.output_folder, filename)
+        doc.save(filepath)
+        logger.info(f"✅ Traffic per site report saved: {filepath}")
+        return filepath
+
+    def generate_traffic_group_excel_report(self, scope_label: str, site_names: List[str],
+                                             start_date: str, end_date: str) -> Optional[bytes]:
+        """Same data as generate_traffic_group_word_report(), as .xlsx: an
+        Info sheet, a Detail sheet (per-site-per-day rows), a Trend sheet
+        (summed-across-selection, one row per date - the numbers behind the
+        charts), and a Charts sheet with one native Excel line chart per
+        metric plotted off the Trend sheet - so the workbook stays
+        pivot-able AND is graph-ready without opening the Word report."""
+        detail = self.build_site_traffic_detail(site_names, start_date, end_date)
+        if detail is None or detail.empty:
+            return None
+        agg_trend = self.build_site_traffic_aggregate_trend(site_names, start_date, end_date)
+        with_data, no_data = self.split_sites_by_traffic_data(site_names, detail)
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            info_rows = [
+                ['Report', 'Traffic per Site'],
+                ['Scope', scope_label],
+                ['Date Range', f'{start_date} to {end_date}'],
+                ['Sites', ', '.join(with_data)],
+                ['Sites without traffic data', ', '.join(no_data) or '-'],
+                ['Generated', datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+            ]
+            pd.DataFrame(info_rows, columns=['Field', 'Value']).to_excel(writer, sheet_name='Info', index=False)
+            detail.to_excel(writer, sheet_name='Detail', index=False)
+            if agg_trend is not None and not agg_trend.empty:
+                agg_trend.to_excel(writer, sheet_name='Trend', index=False)
+            autofit_excel_columns(writer)
+
+            if agg_trend is not None and not agg_trend.empty:
+                wb = writer.book
+                trend_ws = wb['Trend']
+                chart_ws = wb.create_sheet('Charts')
+                metric_cols = [c for c in agg_trend.columns if c != 'Date']
+                n_rows = len(agg_trend) + 1  # header row + data rows
+                anchor_row = 1
+                for col_name in metric_cols:
+                    col_idx = agg_trend.columns.get_loc(col_name) + 1  # openpyxl columns are 1-based
+                    chart = LineChart()
+                    chart.title = col_name
+                    chart.height = 7
+                    chart.width = 14
+                    chart.y_axis.title = col_name
+                    data_ref = Reference(trend_ws, min_col=col_idx, min_row=1, max_row=n_rows)
+                    cats_ref = Reference(trend_ws, min_col=1, min_row=2, max_row=n_rows)
+                    chart.add_data(data_ref, titles_from_data=True)
+                    chart.set_categories(cats_ref)
+                    chart_ws.add_chart(chart, f"A{anchor_row}")
+                    anchor_row += 16  # clears one chart's rendered height before the next
+
+        buf.seek(0)
+        return buf.read()
 
     # ------------------------------------------------------------------
     # Entry point

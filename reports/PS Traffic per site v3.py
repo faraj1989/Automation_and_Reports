@@ -56,6 +56,39 @@ def clean_csv_content(file_content):
     return '\n'.join(data_lines)
 
 
+def find_flat_ps_traffic_files(unzipped_folder):
+    """This project's own daily SFTP download (scheduler.py, ftp_config.json
+    local_root) unzips the "PS CS Daily Traffic per site_2G_3G_4G" report as
+    flat CSVs straight into unzipped/ - no per-report subfolder - and Huawei
+    writes their "(PS Traffic 2G)" suffix with non-breaking spaces (\\xa0),
+    so match on a normalized name. Exact suffix only: the TRIPOLI report's
+    "(PS CS Traffic 2G)" files sit in the same folder and must not match."""
+    found = {"2G": None, "3G": None, "4G": None}
+    if not os.path.isdir(unzipped_folder):
+        return None, None, None
+    for f in sorted(os.listdir(unzipped_folder)):
+        name = f.replace("\xa0", " ")
+        if not name.endswith(".csv"):
+            continue
+        for tech in found:
+            if name.endswith(f"(PS Traffic {tech}).csv"):
+                found[tech] = os.path.join(unzipped_folder, f)
+    return found["2G"], found["3G"], found["4G"]
+
+
+def latest_date_folder_with_ps_traffic(base_dir):
+    """Newest <base_dir>/<day>/ whose unzipped/ holds all three flat PS
+    Traffic CSVs - day folders are named YYYY-MM-DD (or YYYYMMDD), so a
+    reverse name sort is newest-first."""
+    base_dir = Path(base_dir)
+    if not base_dir.is_dir():
+        return None
+    for day in sorted((p for p in base_dir.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True):
+        if all(find_flat_ps_traffic_files(str(day / "unzipped"))):
+            return day
+    return None
+
+
 def find_ps_traffic_files(unzipped_folder):
     """
     Find the PS Daily Traffic 2G, 3G, and 4G CSV files in the unzipped folder.
@@ -67,6 +100,12 @@ def find_ps_traffic_files(unzipped_folder):
         return None, None, None
 
     print(f"🔍 Searching for PS Traffic files in: {unzipped_folder}")
+
+    flat_files = find_flat_ps_traffic_files(unzipped_folder)
+    if all(flat_files):
+        for tech, path in zip(("2G", "3G", "4G"), flat_files):
+            print(f"  ✅ {tech}: {os.path.basename(path)}")
+        return flat_files
 
     # First, find the PS Traffic folder (starting with 'PS Daily Traffic_2G_3G_4G')
     ps_traffic_folder = None
@@ -661,8 +700,10 @@ def main():
     args = parse_args()
 
     base_dir = Path(args.base_dir)
-    date_str = args.date if args.date else datetime.now().strftime("%Y%m%d")
-    date_folder = base_dir / date_str
+    if args.date:
+        date_folder = base_dir / args.date
+    else:
+        date_folder = latest_date_folder_with_ps_traffic(base_dir) or base_dir / datetime.now().strftime("%Y%m%d")
     output_folder = Path(args.output_dir) if args.output_dir else date_folder / "output"
     archive_dir = Path(args.archive_dir) if args.archive_dir else PS_TRAFFIC_HISTORY_DIR
 
@@ -776,4 +817,7 @@ def main():
 
 # Run the script
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # main() returns the combined DataFrame on success and None on failure -
+    # map that to a real exit code (passing the DataFrame itself to
+    # SystemExit exited 1 on success and 0 on failure).
+    raise SystemExit(0 if main() is not None else 1)

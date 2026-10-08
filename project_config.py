@@ -7,6 +7,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_ROOT / ".env"
 LOGIN_FAILURE_DIR = PROJECT_ROOT / "logs" / "login_failures"
+PAUSED_DIR = PROJECT_ROOT / "logs" / "paused"
 
 
 class LoginFailedError(RuntimeError):
@@ -155,3 +156,22 @@ def is_login_failed_today(script_name, password=None):
     if password is not None and recorded is not None and _password_fingerprint(password) != recorded:
         return False
     return True
+
+
+def _paused_marker_path(script_name):
+    return PAUSED_DIR / f"{script_name.replace(' ', '_')}.txt"
+
+
+def is_paused(script_name):
+    """True while script_name is paused from the control panel - the watchdog
+    then leaves it stopped instead of relaunching it every check."""
+    return _paused_marker_path(script_name).exists()
+
+
+def set_paused(script_name, paused):
+    marker = _paused_marker_path(script_name)
+    if paused:
+        PAUSED_DIR.mkdir(parents=True, exist_ok=True)
+        marker.write_text(date.today().isoformat(), encoding="utf-8")
+    else:
+        marker.unlink(missing_ok=True)

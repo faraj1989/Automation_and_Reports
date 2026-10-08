@@ -35,6 +35,8 @@ from backend.traffic_kpi_processor import process_traffic_with_aggregation
 from backend.user_kpi_processor import process_user_kpis, aggregate_user_data
 from backend.site_detail_processor import generate_site_detail, get_latest_available_day
 from backend.report_generator import ReportGenerator
+from backend.history_integrity import run_and_log as run_history_integrity_check
+import periodic_jobs
 
 # Setup logging
 LOG_FILE = "scheduler.log"
@@ -122,6 +124,12 @@ class DailyScheduler:
 
             logger.info("🚨 Step 8.5: Archiving NOC Daily Alarm Summary...")
             self._archive_noc_daily_alarm_summary(target_date)
+
+            # Step 8.6: Validate history holds only complete business days
+            # (no today/future rows, no duplicate keys, no recent gaps) -
+            # report-only, never aborts the run
+            logger.info("🔎 Step 8.6: Checking history integrity...")
+            run_history_integrity_check()
 
             # Step 9: Export to Excel
             logger.info("💾 Step 9: Exporting to Excel...")
@@ -245,7 +253,8 @@ class DailyScheduler:
                 self.history_mgr.update_user_kpis(raw_results)
                 summary_df = aggregate_user_data(raw_results)
                 if summary_df is not None:
-                    self.history_mgr.update_user_summary(summary_df)
+                    self.history_mgr.update_user_summary(
+                        summary_df, source=f"{os.path.relpath(day_folder, local_root)} (aggregated user reports)")
 
     def _process_site_detail(self):
         """Step 7: Generate Site Detail"""
@@ -567,6 +576,51 @@ class DailyScheduler:
             logger.error(traceback.format_exc())
             return False
 
+    def run_cem_monthly_report(self, month=None):
+        """Entry point for the monthly (2nd-of-month) scheduled task: builds
+        the previous month's SmartCare CEM Comprehensive Analysis workbook for
+        Tripoli HQ (3 sheets, HQ's format) into Monthly_CEM_Reports. Returns
+        False while the month still has missing days, so the watchdog
+        backstop (periodic_jobs.py) retries it after the daily SmartCare runs
+        have filled them - the file is still written each time, so the most
+        complete version is always on disk."""
+        from backend import smartcare_cem_processor as smartcare_cem
+        if month is None:
+            first_this_month = datetime.now().replace(day=1)
+            month = (first_this_month - timedelta(days=1)).strftime('%Y-%m')
+        logger.info("=" * 70)
+        logger.info(f"📊 BUILDING MONTHLY CEM COMPREHENSIVE ANALYSIS - {month}")
+        logger.info("=" * 70)
+        try:
+            path, info = smartcare_cem.save_monthly_cem_report(month)
+            logger.info(f"   💾 {path}")
+            logger.info(f"   📅 {len(info['present'])}/{info['days_in_month']} days")
+            if info['missing']:
+                logger.warning(f"   ⚠️ Missing day(s): {', '.join(info['missing'])} - will retry")
+                return False
+            logger.info("✅ MONTHLY CEM REPORT COMPLETE")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Monthly CEM report failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+
+def run_periodic_job(job, fn):
+    """Run one weekly/monthly job under its lock and record a success stamp
+    (see periodic_jobs.py - the watchdog re-runs any job that has none for
+    its latest due time). Returns the process exit code, so a failed run
+    shows as failed in Task Scheduler instead of a silent 0."""
+    with periodic_jobs.job_lock(job) as acquired:
+        if not acquired:
+            logger.warning(f"⏭️ {job} is already running (pid {periodic_jobs.lock_holder(job)}) - skipping this launch")
+            return 0
+        ok = fn()
+        if ok:
+            periodic_jobs.mark_success(job)
+        return 0 if ok else 1
+
 
 def main():
     parser = argparse.ArgumentParser(description='Libyana NPM Daily Scheduler')
@@ -582,6 +636,9 @@ def main():
     parser.add_argument('--ps-traffic-weekly', action='store_true',
                          help='Run only the weekly PS Traffic per site report '
                               '(reports/"PS Traffic per site v3.py"), not the full daily pipeline')
+    parser.add_argument('--cem-monthly', nargs='?', const='', metavar='YYYY-MM',
+                         help="Build the monthly SmartCare CEM Comprehensive Analysis workbook for Tripoli HQ "
+                              "(default: previous month), not the full daily pipeline")
     args = parser.parse_args()
 
     scheduler = DailyScheduler()
@@ -591,16 +648,18 @@ def main():
         return
 
     if args.interference_weekly:
-        scheduler.run_interference_weekly_update()
-        return
+        sys.exit(run_periodic_job("interference-weekly", scheduler.run_interference_weekly_update))
 
     if args.cell_info_monthly:
-        scheduler.run_cell_info_monthly_update()
-        return
+        sys.exit(run_periodic_job("cell-info-monthly", scheduler.run_cell_info_monthly_update))
 
     if args.ps_traffic_weekly:
-        scheduler.run_ps_traffic_weekly_update()
-        return
+        sys.exit(run_periodic_job("ps-traffic-weekly", scheduler.run_ps_traffic_weekly_update))
+
+    if args.cem_monthly is not None:
+        if args.cem_monthly:  # an explicit month: a manual rebuild, not the scheduled job
+            sys.exit(0 if scheduler.run_cem_monthly_report(args.cem_monthly) else 1)
+        sys.exit(run_periodic_job("cem-monthly", scheduler.run_cem_monthly_report))
 
     if args.date:
         target_date = args.date
